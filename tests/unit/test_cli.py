@@ -12,11 +12,14 @@ import pytest
 
 from retail_sim.cli import (
     build_parser,
+    handle_promo_add,
     handle_replenish_run,
     handle_sales_run,
     handle_simulate,
     main,
 )
+from retail_sim.domain.models import SalePeriod
+from retail_sim.repositories.stores import StoreNotFoundError
 from retail_sim.simulation.day_runner import DayResult
 from retail_sim.simulation.period_runner import PeriodResult
 from retail_sim.steps.s1_supplier import SupplierResult
@@ -368,6 +371,203 @@ def test_main_dispatches_simulate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("retail_sim.cli.handle_simulate", handler)
     assert main(["simulate", "--from", "2026-06-01", "--to", "2026-06-03"]) == 0
     assert seen == [date(2026, 6, 1), date(2026, 6, 3)]
+
+
+def test_build_parser_promo_add_store_ids() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "promo",
+            "add",
+            "--from",
+            "2026-06-01",
+            "--to",
+            "2026-06-07",
+            "--factor",
+            "0.8",
+            "--store-id",
+            "3",
+            "8",
+        ]
+    )
+    assert args.subcommand == "promo"
+    assert args.promo_command == "add"
+    assert args.date_from == date(2026, 6, 1)
+    assert args.date_to == date(2026, 6, 7)
+    assert args.factor == Decimal("0.8")
+    assert args.store_id == [3, 8]
+    assert args.all is False
+
+
+def test_build_parser_promo_add_requires_a_target() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["promo", "add", "--from", "2026-06-01", "--to", "2026-06-07", "--factor", "0.8"]
+        )
+
+
+def test_build_parser_promo_add_rejects_a_non_decimal_factor() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "promo",
+                "add",
+                "--from",
+                "2026-06-01",
+                "--to",
+                "2026-06-07",
+                "--factor",
+                "abc",
+                "--all",
+            ]
+        )
+
+
+def test_handle_promo_add_prints_period(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _Conn:
+        def transaction(self) -> nullcontext[None]:
+            return nullcontext()
+
+    @contextmanager
+    def fake_connection(_settings: object) -> Iterator[_Conn]:
+        yield _Conn()
+
+    def stores(_conn: object) -> list[SimpleNamespace]:
+        return [SimpleNamespace(id=3), SimpleNamespace(id=8)]
+
+    def insert(
+        _conn: object,
+        date_from: date,
+        date_to: date,
+        factor: Decimal,
+        store_ids: list[int],
+    ) -> SalePeriod:
+        assert date_from == date(2026, 6, 1)
+        assert date_to == date(2026, 6, 7)
+        assert factor == Decimal("0.8")
+        assert store_ids == [3, 8]
+        return SalePeriod(4, date_from, date_to, Decimal("0.8000"), (3, 8))
+
+    monkeypatch.setattr("retail_sim.cli.get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr("retail_sim.cli.get_connection", fake_connection)
+    monkeypatch.setattr("retail_sim.cli.list_stores", stores)
+    monkeypatch.setattr("retail_sim.cli.insert_sale_period", insert)
+
+    code = handle_promo_add(
+        argparse.Namespace(
+            all=True,
+            store_id=None,
+            date_from=date(2026, 6, 1),
+            date_to=date(2026, 6, 7),
+            factor=Decimal("0.8"),
+        )
+    )
+
+    assert code == 0
+    assert (
+        "Sale period 4: 2026-06-01..2026-06-07, factor 0.8000, 2 store(s)."
+        in capsys.readouterr().out
+    )
+
+
+def test_handle_promo_add_rejects_empty_all(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _Conn:
+        def transaction(self) -> nullcontext[None]:
+            return nullcontext()
+
+    @contextmanager
+    def fake_connection(_settings: object) -> Iterator[_Conn]:
+        yield _Conn()
+
+    def insert(*_args: object, **_kwargs: object) -> SalePeriod:
+        raise AssertionError("period must not be inserted")
+
+    monkeypatch.setattr("retail_sim.cli.get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr("retail_sim.cli.get_connection", fake_connection)
+    monkeypatch.setattr("retail_sim.cli.list_stores", lambda _conn: [])
+    monkeypatch.setattr("retail_sim.cli.insert_sale_period", insert)
+
+    code = handle_promo_add(
+        argparse.Namespace(
+            all=True,
+            store_id=None,
+            date_from=date(2026, 6, 1),
+            date_to=date(2026, 6, 7),
+            factor=Decimal("0.8"),
+        )
+    )
+
+    assert code == 1
+    assert "at least one store" in capsys.readouterr().err
+
+
+def test_handle_promo_add_unknown_store(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _Conn:
+        def transaction(self) -> nullcontext[None]:
+            return nullcontext()
+
+    @contextmanager
+    def fake_connection(_settings: object) -> Iterator[_Conn]:
+        yield _Conn()
+
+    def insert(*_args: object, **_kwargs: object) -> SalePeriod:
+        raise StoreNotFoundError(9)
+
+    monkeypatch.setattr("retail_sim.cli.get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr("retail_sim.cli.get_connection", fake_connection)
+    monkeypatch.setattr("retail_sim.cli.insert_sale_period", insert)
+
+    code = handle_promo_add(
+        argparse.Namespace(
+            all=False,
+            store_id=[9],
+            date_from=date(2026, 6, 1),
+            date_to=date(2026, 6, 7),
+            factor=Decimal("0.8"),
+        )
+    )
+
+    assert code == 1
+    assert "Store 9 does not exist" in capsys.readouterr().err
+
+
+def test_main_dispatches_promo_add(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Decimal] = []
+
+    def handler(args: argparse.Namespace) -> int:
+        seen.append(args.factor)
+        return 0
+
+    monkeypatch.setattr("retail_sim.cli.handle_promo_add", handler)
+    assert (
+        main(
+            [
+                "promo",
+                "add",
+                "--from",
+                "2026-06-01",
+                "--to",
+                "2026-06-07",
+                "--factor",
+                "0.8",
+                "--store-id",
+                "3",
+            ]
+        )
+        == 0
+    )
+    assert seen == [Decimal("0.8")]
 
 
 def test_build_parser_db_migrate_custom_dir() -> None:

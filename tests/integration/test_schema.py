@@ -29,6 +29,8 @@ EXPECTED_TABLES = {
     "receipts",
     "receipt_lines",
     "simulation_runs",
+    "sale_periods",
+    "sale_period_stores",
 }
 
 EXPECTED_INDEXES = {
@@ -37,6 +39,7 @@ EXPECTED_INDEXES = {
     "idx_receipts_store_ts",
     "idx_receipts_ts",
     "idx_simulation_runs_started_at",
+    "idx_sale_period_stores_store",
 }
 
 pytestmark = pytest.mark.skipif(
@@ -265,6 +268,36 @@ def test_rejects_store_with_missing_warehouse(db_conn: Connection[Any]) -> None:
         ) VALUES (%s, %s, %s, %s, %s, %s, %s)
         """,
         (store_location_id, 999_999_999, "North", "100.00", 10, time(10, 0), time(21, 0)),
+    )
+
+
+def test_rejects_bad_sale_period(db_conn: Connection[Any]) -> None:
+    _expect_violation(
+        db_conn,
+        psycopg.errors.CheckViolation,
+        """
+        INSERT INTO sale_periods (date_from, date_to, price_factor)
+        VALUES (%s, %s, %s)
+        """,
+        (date(2026, 6, 1), date(2026, 6, 7), "1"),
+    )
+    _expect_violation(
+        db_conn,
+        psycopg.errors.CheckViolation,
+        """
+        INSERT INTO sale_periods (date_from, date_to, price_factor)
+        VALUES (%s, %s, %s)
+        """,
+        (date(2026, 6, 1), date(2026, 6, 7), "0"),
+    )
+    _expect_violation(
+        db_conn,
+        psycopg.errors.CheckViolation,
+        """
+        INSERT INTO sale_periods (date_from, date_to, price_factor)
+        VALUES (%s, %s, %s)
+        """,
+        (date(2026, 6, 8), date(2026, 6, 1), "0.8000"),
     )
 
 

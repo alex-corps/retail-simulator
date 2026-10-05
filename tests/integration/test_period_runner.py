@@ -38,6 +38,8 @@ def _isolate(conn: Connection[Any]) -> None:
             "inventory_movements",
             "daily_opening_stock",
             "simulation_runs",
+            "sale_period_stores",
+            "sale_periods",
             "stores",
             "warehouses",
             "storage_locations",

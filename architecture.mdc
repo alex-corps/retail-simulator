@@ -7,23 +7,27 @@ alwaysApply: true
 
 ## Purpose
 
-Python + PostgreSQL day-by-day simulator of a supermarket network:
+Python + PostgreSQL simulator of one day in a supermarket network, repeated across a date range. A day is opening stock, supplier receipts, store assortment, warehouse-to-store replenishment, then in-store sales. Every inventory effect is a signed row in `inventory_movements`. Sales also produce `receipts` and `receipt_lines`.
 
-- supplier receipts into warehouses
-- transfers warehouse ↔ store
-- in-store sales (receipts + receipt lines)
-- all inventory effects recorded in `inventory_movements`
+A period commits one day at a time. `simulation_runs` records `days_done` / `days_total`, so a run can be resumed and watched while it is still going. Invariants run at the end of the day; a failure rolls that day back and marks the run failed.
 
-Admin capabilities:
+The operator can, today:
 
-- add / open stores
-- optimize store assortment
-- run simulation for a date range
+- load manual reference data (the app does not generate a seed)
+- request assortment optimization (`flag = 1`; the next day that includes S2 sets it to `2`)
+- run one day (`supply`, `replenish`, `sales`) or a date range (`simulate`, with `--resume`)
+- add a sale period (`promo add`). On a covered store-day the store sells at `price_factor` of the retail price and planned day revenue is multiplied by `price_factor ** (1 - E)` (`E = 1.5`), so unit volume follows constant elasticity. Overlapping periods keep the smallest `price_factor`
+
+Specified, not built yet:
+
+- web panel on the same spec: start a period and read its progress, edit sale periods, set the optimization flag, list finished runs
+- store creation (`stores add` in `retail-simulator-logic.txt`)
 
 Reference manuals (source of truth for business rules):
 
 - `retail-simulator-data structure.txt` — tables; `(man)` manual, `(alg)` algorithm-filled
-- `retail-simulator-logic.txt` — daily simulation steps 0–4 and store creation
+- `retail-simulator-logic.txt` — daily steps 0–4 and store creation
+- `retail-simulator-logic add1.txt` — sale periods, the sales response to a discount, and the web panel
 
 **No automatic seed generation.** Manual reference data (`(man)`) is loaded by the operator. The app only creates schema and runs algorithms that write `(alg)` tables.
 
@@ -37,7 +41,7 @@ Reference manuals (source of truth for business rules):
 | Package / run | `uv` | `uv run`, `uv add` — never plain pip/poetry |
 | DB | PostgreSQL 16 | `docker-compose.yml` |
 | DB access | psycopg 3 + raw SQL | no ORM; use `cursor.copy()` for bulk inserts |
-| Migrations | numbered `.sql` + custom runner | table `schema_migrations` |
+| Migrations | numbered `.sql` + custom runner | table `schema_migrations`; each file commits on its own. The runner commits the read of applied versions first, so a migration is not a savepoint that `close()` would roll back |
 | Config | `pydantic-settings` | `.env` / env vars |
 | CLI | `argparse` | entry point `retail-sim` |
 | RNG | stdlib `random` | seeded `Random` from `(global seed, stream, date, store_id)`; `numpy` is not a dependency |
@@ -73,17 +77,17 @@ retail-simulator/
   .env.example
   architecture.mdc              # this document
   retail-simulator-*.txt        # business specs
-  migrations/                   # 0001_init.sql … 0004_simulation_runs.sql
+  migrations/                   # 0001_init.sql … 0005_sale_periods.sql
   src/retail_sim/
     config.py
-    cli.py                      # db migrate | assortment | supply | replenish | sales
+    cli.py                      # db | assortment | supply | replenish | sales | simulate | promo
     rng.py                      # seeded Random(global seed, stream, date, store_id)
     db/
       connection.py
       migrate.py
       copy.py
     domain/
-      enums.py                  # LocationType, OperationType, OptimizationFlag
+      enums.py                  # LocationType, OperationType, OptimizationFlag, RunStatus
       models.py                 # frozen dataclasses
       calendar.py               # Mon/Thu supply, Mon/Wed/Fri replenish
     core/
@@ -91,10 +95,11 @@ retail-simulator/
       assortment.py
       allocation.py             # Hamilton split when the warehouse is short
       receipts.py               # receipt amounts, timestamps, SKU fill
+      promo.py                  # price factor, revenue elasticity, discount
       stock.py                  # DayStock, NegativeStockError
       retention.py              # which opening-stock dates to keep
     repositories/
-      products.py stores.py movements.py stock.py params.py locations.py receipts.py runs.py
+      products.py stores.py movements.py stock.py params.py locations.py receipts.py runs.py promo.py
     steps/
       s0_opening_stock.py
       s1_supplier.py
@@ -110,7 +115,7 @@ retail-simulator/
     integration/
 ```
 
-Not in the tree yet (later steps): `core/promo.py`, `repositories/promo.py`, `core/store_factory.py`, `web/`.
+Not in the tree yet (later steps): `core/store_factory.py`, `web/`.
 
 ---
 
@@ -137,6 +142,8 @@ Not in the tree yet (later steps): `core/promo.py`, `repositories/promo.py`, `co
 | Чеки | `receipts` |
 | Чеки, товары | `receipt_lines` |
 | Прогоны расчёта | `simulation_runs` |
+| Периоды распродаж | `sale_periods` |
+| Периоды распродаж, магазины | `sale_period_stores` |
 
 ### Critical schema rules
 
@@ -154,7 +161,8 @@ Not in the tree yet (later steps): `core/promo.py`, `repositories/promo.py`, `co
 - PK: `daily_opening_stock (stock_date, storage_location_id, product_id)`, `store_assortment (store_id, product_id)`.
 - `op_type ∈ ('приход','перемещение','продажа')`.
 - A sale is one `inventory_movements` row per receipt line, not a day total: `op_ts` is the receipt timestamp, `quantity` is −N, `sender_location_id` is the store location, `receiver_location_id` is NULL.
-- `receipt_lines` PK is `(receipt_id, product_id)`, so a SKU taken more than once on one receipt is a single row. `sale_price` is the product retail price. `discount_pct` and `clearance_flag` default to 0; S4 never sets them.
+- `receipt_lines` PK is `(receipt_id, product_id)`, so a SKU taken more than once on one receipt is a single row. Outside a sale period `sale_price` is the retail price, `discount_pct` is 0 and `clearance_flag` is 0. On a promo day `sale_price` is the retail price times `price_factor` (kopeck, half up), `discount_pct` is `(1 - price_factor) * 100`, and `clearance_flag` is 1.
+- `sale_periods.price_factor` is `NUMERIC(8, 4)` in `(0, 1)`. Both dates are inclusive. `sale_period_stores` is the store list captured when the period is added (`--all` is the stores that exist then, not stores created later). Overlapping periods for one store-day keep the smallest `price_factor`.
 - Receipt indexes: `idx_receipts_store_ts (store_id, receipt_ts)`, `idx_receipts_ts (receipt_ts)`. Deleting a day uses a half-open `receipt_ts` range so `idx_receipts_ts` applies. COPY into `receipts` passes `id` explicitly (`nextval` first), because COPY does not return generated ids.
 - Optimization flag: `0` idle, `1` requested, `2` completed (set manually to `1`).
 - `simulation_runs` is one row per period run (history is not overwritten). Progress is `days_done` / `days_total`. The last committed day is `last_done_date`: the column is not named `current_date` because that word is reserved in PostgreSQL.
@@ -181,7 +189,7 @@ PeriodRunner
        ├─ S1 Supplier receipt (cold start 1000/sku; else Mon/Thu replenish)
        ├─ S2 Assortment (new store or flag=1; delisted SKU → return to warehouse)
        ├─ S3 Warehouse → store (Mon/Wed/Fri; deficit capped by warehouse stock)
-       ├─ S4 Sales (receipts + lines + one sale movement per line)
+       ├─ S4 Sales (receipts + lines + one sale movement per line; promo price and elasticity)
        └─ Invariants
 ```
 
@@ -191,7 +199,7 @@ PeriodRunner
 1. **Supplier** — if no movements: +1000 per SKU to each warehouse, any weekday. Else Mon/Thu: `max(0, ceil(avg * target_stock_days_warehouse − current))`. Avg is warehouse outflow to stores over `[day−21, day−1]` (negative transfer rows only; returns ignored) divided by days in that window with an outflow or opening stock > 0. No such days → avg 0, so a new SKU is not ordered. Re-running the day deletes that day's supplier receipts and recalculates; rolling back a receipt already shipped onward raises `NegativeStockError`.
 2. **Assortment** — new store: random SKUs up to capacity, even subcategory coverage. Flag=1: best SKUs by global avg sales within subcategories; return positive stock of delisted SKUs to warehouse; set flag=2.
 3. **Replenish** — Mon/Wed/Fri. Avg store sales over days with stock>0 or sales>0 in last 21 days; if avg=0 and stock=0 use `ceil` of the store assortment average. Need is `ceil(avg * target_stock_days_store − current)`, floored at 0. When current stock is 0, quantity is `max(need, round-half-up(avg))`; otherwise it is `need`. Never ship more than warehouse stock: Hamilton allocation (largest remainder; smaller `store_id` wins ties). Re-running the day deletes that day's warehouse→store transfers first. A sale of those units raises `NegativeStockError`.
-4. **Sales** — plan revenue = avg check × (store avg receipts ±20%). Receipt amount is avg check × 0.5..2.0 in 70% of cases and uniform between min and max check in 30%. Emit checks until planned check totals exceed day revenue. Timestamps sit on an even slot grid inside opening hours, with jitter inside the slot. Fill with random in-stock assortment SKUs, 1 unit at a time, until the check amount is exceeded or stock is empty; the unit that crosses the amount stays on the check. Drop empty checks and stop the store once it is sold out. Write receipt tables and one sale movement per receipt line (`op_ts` is the receipt time, quantity −N, no receiver). Re-running the day deletes that day's receipts and sale movements.
+4. **Sales** — plan revenue = avg check × (store avg receipts ±20%). Receipt amount is avg check × 0.5..2.0 in 70% of cases and uniform between min and max check in 30%. Emit checks until planned check totals exceed day revenue. Timestamps sit on an even slot grid inside opening hours, with jitter inside the slot. Fill with random in-stock assortment SKUs, 1 unit at a time, until the check amount is exceeded or stock is empty; the unit that crosses the amount stays on the check. Drop empty checks and stop the store once it is sold out. Write receipt tables and one sale movement per receipt line (`op_ts` is the receipt time, quantity −N, no receiver). Re-running the day deletes that day's receipts and sale movements. On a promo day the planned ruble revenue is multiplied by `price_factor ** (1 - 1.5)` and lines use the discounted price, so units scale by about `price_factor ** -1.5`. The check-amount draw itself is unchanged. A store with no covering period is unchanged, including its RNG stream.
 
 Store creation (admin): N new storage locations + stores; names from unused `store_name_pool`; receipts ±50% of network avg; capacity `floor((store_receipts/network_receipts)*avg_capacity)`; hours 10:00±3h … 21:00±2h.
 
@@ -209,12 +217,12 @@ retail-sim supply run --date DATE                # S0, then S1
 retail-sim replenish run --date DATE             # S0, drop S3, S1, S2, S3
 retail-sim sales run --date DATE                 # run_day: S0 … S4, then invariants
 retail-sim simulate --from DATE --to DATE [--resume] [--no-journal]
+retail-sim promo add --from DATE --to DATE --factor FACTOR (--store-id ID... | --all)
 ```
 
 Still target:
 
 ```text
-retail-sim promo add --from DATE --to DATE --factor FACTOR (--store-id ID... | --all)
 retail-sim web [--host HOST] [--port PORT]
 retail-sim stores add N
 ```
@@ -235,11 +243,11 @@ Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`). Optimization flag 
 | 6 | Warehouse→store + deficit allocation | Done |
 | 7 | Receipt generation + COPY | Done |
 | 8 | Period runner, invariants, resume-from-date, `simulation_runs` | Done |
-| 9 | Sale periods and discount-elastic sales (`price_factor^(1-E)`, E=1.5) | Pending |
+| 9 | Sale periods and discount-elastic sales (`price_factor^(1-E)`, E=1.5) | Done |
 | 10 | Web panel (FastAPI + Jinja2): run a period, promo, optimization flag, history | Pending |
 | 11 | Store creation (`stores add`) | Pending |
 
-`list_unused_store_names` is already in place for step 11. Sale periods and the panel are specified in `retail-simulator-logic add1.txt`: overlapping promos for one store take the largest discount (smallest `price_factor`).
+`list_unused_store_names` is already in place for step 11. Sale periods live in `sale_periods` / `sale_period_stores`; overlapping promos for one store take the largest discount (smallest `price_factor`). The panel remains specified in `retail-simulator-logic add1.txt`.
 
 ---
 

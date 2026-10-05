@@ -60,6 +60,15 @@ class CalculationParameters:
 
 
 @dataclass(frozen=True, slots=True)
+class SalePeriod:
+    id: int
+    date_from: date
+    date_to: date
+    price_factor: Decimal
+    store_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StoreAssortmentItem:
     store_id: int
     product_id: int

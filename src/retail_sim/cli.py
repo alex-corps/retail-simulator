@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -10,6 +11,7 @@ from retail_sim.config import get_settings
 from retail_sim.db.connection import get_connection
 from retail_sim.db.migrate import apply_migrations
 from retail_sim.domain.enums import OptimizationFlag
+from retail_sim.repositories.promo import insert_sale_period
 from retail_sim.repositories.stores import StoreNotFoundError, list_stores, set_optimization_flag
 from retail_sim.simulation.day_runner import run_day
 from retail_sim.simulation.period_runner import resume_start_date, run_period
@@ -107,7 +109,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not write a simulation_runs row",
     )
 
+    promo_parser = subparsers.add_parser("promo", help="Sale period commands")
+    promo_subparsers = promo_parser.add_subparsers(dest="promo_command", required=True)
+    add_promo_parser = promo_subparsers.add_parser("add", help="Add a sale period")
+    add_promo_parser.add_argument(
+        "--from",
+        dest="date_from",
+        type=date.fromisoformat,
+        required=True,
+    )
+    add_promo_parser.add_argument(
+        "--to",
+        dest="date_to",
+        type=date.fromisoformat,
+        required=True,
+    )
+    add_promo_parser.add_argument("--factor", type=_parse_factor, required=True)
+    promo_target = add_promo_parser.add_mutually_exclusive_group(required=True)
+    promo_target.add_argument("--store-id", type=int, nargs="+")
+    promo_target.add_argument("--all", action="store_true")
+
     return parser
+
+
+def _parse_factor(value: str) -> Decimal:
+    try:
+        return Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(f"invalid factor {value}") from exc
 
 
 def handle_db_migrate(args: argparse.Namespace) -> int:
@@ -248,6 +277,36 @@ def handle_simulate(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_promo_add(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    try:
+        with get_connection(settings) as conn, conn.transaction():
+            if args.all:
+                store_ids = [store.id for store in list_stores(conn)]
+            else:
+                store_ids = list(args.store_id)
+            if not store_ids:
+                raise ValueError("sale period must include at least one store")
+            period = insert_sale_period(
+                conn,
+                args.date_from,
+                args.date_to,
+                args.factor,
+                store_ids,
+            )
+    except StoreNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(
+        f"Sale period {period.id}: {period.date_from.isoformat()}..{period.date_to.isoformat()}, "
+        f"factor {period.price_factor}, {len(period.store_ids)} store(s)."
+    )
+    return 0
+
+
 def handle_assortment_optimize(args: argparse.Namespace) -> int:
     settings = get_settings()
     try:
@@ -283,6 +342,8 @@ def main(argv: list[str] | None = None) -> int:
         return handle_sales_run(args)
     if args.subcommand == "simulate":
         return handle_simulate(args)
+    if args.subcommand == "promo" and args.promo_command == "add":
+        return handle_promo_add(args)
 
     return 0
 

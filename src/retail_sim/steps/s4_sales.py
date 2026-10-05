@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any
 
+from retail_sim.core.promo import discount_percent, sale_price, scale_day_revenue
 from retail_sim.core.receipts import (
     AvailableSkus,
     fill_receipt,
@@ -15,6 +16,7 @@ from retail_sim.domain.enums import OperationType
 from retail_sim.repositories.movements import MovementDraft, delete_sales, insert_movements
 from retail_sim.repositories.params import get_calculation_parameters
 from retail_sim.repositories.products import list_products
+from retail_sim.repositories.promo import effective_price_factors
 from retail_sim.repositories.receipts import (
     delete_day_receipts,
     insert_receipt_lines,
@@ -49,7 +51,9 @@ class _BuiltReceipt:
     store_id: int
     location_id: int
     receipt_ts: datetime
-    lines: tuple[tuple[int, int], ...]
+    lines: tuple[tuple[int, int, Decimal], ...]
+    discount_pct: Decimal
+    clearance_flag: int
 
 
 def rollback_sales(conn: Connection[Any], day: date, stock: DayStock) -> int:
@@ -68,6 +72,8 @@ def run_sales(conn: Connection[Any], day: date, stock: DayStock, seed: int) -> S
     prices = {product.id: product.retail_price for product in list_products(conn)}
     prices_kop = {product_id: _kopecks(price) for product_id, price in prices.items()}
     assortment = list_assortment_by_store(conn)
+    # Нет периода — план выручки и последовательность случайных чисел не меняются.
+    factors = effective_price_factors(conn, day)
     avg_kop = _kopecks(params.avg_receipt_amount)
     min_kop = _kopecks(params.min_receipt_amount)
     max_kop = _kopecks(params.max_receipt_amount)
@@ -80,7 +86,9 @@ def run_sales(conn: Connection[Any], day: date, stock: DayStock, seed: int) -> S
                 store,
                 assortment.get(store.id, []),
                 stock,
+                prices,
                 prices_kop,
+                factors.get(store.id),
                 avg_kop,
                 min_kop,
                 max_kop,
@@ -89,7 +97,7 @@ def run_sales(conn: Connection[Any], day: date, stock: DayStock, seed: int) -> S
         )
     if not built:
         return SalesResult(0, 0, 0, 0, Decimal("0.00"))
-    return _persist(conn, stock, built, prices)
+    return _persist(conn, stock, built)
 
 
 def _store_receipts(
@@ -97,7 +105,9 @@ def _store_receipts(
     store: Store,
     assortment: list[StoreAssortmentItem],
     stock: DayStock,
+    prices: dict[int, Decimal],
     prices_kop: dict[int, int],
+    price_factor: Decimal | None,
     avg_kop: int,
     min_kop: int,
     max_kop: int,
@@ -111,17 +121,26 @@ def _store_receipts(
     if len(pool) == 0:
         return []
     rng = make_rng(seed, "sales", day.isoformat(), store.id)
-    amounts = plan_receipt_amounts(
-        plan_day_revenue(avg_kop, store.avg_receipts_per_day, rng),
-        avg_kop,
-        min_kop,
-        max_kop,
-        rng,
-    )
+    revenue = plan_day_revenue(avg_kop, store.avg_receipts_per_day, rng)
+    charged = prices
+    unit_prices = prices_kop
+    discount_pct = Decimal("0.00")
+    clearance_flag = 0
+    if price_factor is not None:
+        # Сниженная цена и больший план выручки вместе дают рост штук как f^(-E).
+        revenue = scale_day_revenue(revenue, price_factor)
+        charged = {
+            product_id: sale_price(retail, price_factor) for product_id, retail in prices.items()
+        }
+        unit_prices = {product_id: _kopecks(price) for product_id, price in charged.items()}
+        _require_positive_prices(unit_prices, available)
+        discount_pct = discount_percent(price_factor)
+        clearance_flag = 1
+    amounts = plan_receipt_amounts(revenue, avg_kop, min_kop, max_kop, rng)
     timestamps = receipt_timestamps(day, store.open_from, store.open_to, len(amounts), rng)
     built: list[_BuiltReceipt] = []
     for amount, receipt_ts in zip(amounts, timestamps, strict=True):
-        lines = fill_receipt(amount, prices_kop, pool, rng)
+        lines = fill_receipt(amount, unit_prices, pool, rng)
         # Пустой чек значит, что магазин уже распродан: остальные чеки дня не создаём.
         if not lines:
             break
@@ -130,17 +149,27 @@ def _store_receipts(
                 store_id=store.id,
                 location_id=store.storage_location_id,
                 receipt_ts=receipt_ts,
-                lines=tuple(sorted(lines.items())),
+                lines=tuple(
+                    (product_id, quantity, charged[product_id])
+                    for product_id, quantity in sorted(lines.items())
+                ),
+                discount_pct=discount_pct,
+                clearance_flag=clearance_flag,
             )
         )
     return built
+
+
+def _require_positive_prices(unit_prices: dict[int, int], available: dict[int, int]) -> None:
+    for product_id, quantity in available.items():
+        if quantity > 0 and unit_prices[product_id] <= 0:
+            raise ValueError(f"sale price for product {product_id} rounded to zero")
 
 
 def _persist(
     conn: Connection[Any],
     stock: DayStock,
     built: list[_BuiltReceipt],
-    prices: dict[int, Decimal],
 ) -> SalesResult:
     receipt_ids = reserve_receipt_ids(conn, len(built))
     insert_receipts(
@@ -150,11 +179,20 @@ def _persist(
             for receipt_id, receipt in zip(receipt_ids, built, strict=True)
         ],
     )
-    line_rows: list[tuple[int, int, int, Decimal]] = []
+    line_rows: list[tuple[int, int, int, Decimal, Decimal, int]] = []
     drafts: list[MovementDraft] = []
     for receipt_id, receipt in zip(receipt_ids, built, strict=True):
-        for product_id, quantity in receipt.lines:
-            line_rows.append((receipt_id, product_id, quantity, prices[product_id]))
+        for product_id, quantity, price in receipt.lines:
+            line_rows.append(
+                (
+                    receipt_id,
+                    product_id,
+                    quantity,
+                    price,
+                    receipt.discount_pct,
+                    receipt.clearance_flag,
+                )
+            )
             drafts.append(
                 MovementDraft(
                     op_ts=receipt.receipt_ts,
@@ -173,9 +211,9 @@ def _persist(
 
     revenue = sum(
         (
-            Decimal(quantity) * prices[product_id]
+            Decimal(quantity) * price
             for receipt in built
-            for product_id, quantity in receipt.lines
+            for _product_id, quantity, price in receipt.lines
         ),
         Decimal("0.00"),
     )
@@ -183,7 +221,9 @@ def _persist(
         stores_with_sales=len({receipt.store_id for receipt in built}),
         receipts_created=len(built),
         lines_created=len(line_rows),
-        units_sold=sum(quantity for receipt in built for _product_id, quantity in receipt.lines),
+        units_sold=sum(
+            quantity for receipt in built for _product_id, quantity, _price in receipt.lines
+        ),
         revenue=revenue.quantize(_KOPECK, rounding=ROUND_HALF_UP),
     )
 

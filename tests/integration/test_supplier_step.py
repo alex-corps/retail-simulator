@@ -32,6 +32,8 @@ def _isolate(conn: Connection[Any]) -> None:
             "store_assortment",
             "inventory_movements",
             "daily_opening_stock",
+            "sale_period_stores",
+            "sale_periods",
             "stores",
             "warehouses",
             "storage_locations",

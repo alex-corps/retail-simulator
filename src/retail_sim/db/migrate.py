@@ -44,6 +44,9 @@ def discover_migration_files(migrations_dir: Path) -> list[Path]:
 def apply_migrations(conn: Connection[Any], migrations_dir: Path) -> list[str]:
     ensure_migrations_table(conn)
     applied = get_applied_migrations(conn)
+    # SELECT оставляет транзакцию открытой. Иначе migration() ниже — это savepoint,
+    # и close() соединения откатывает уже «применённую» миграцию.
+    conn.commit()
     available_files = discover_migration_files(migrations_dir)
 
     pending_files = [f for f in available_files if f.name not in applied]

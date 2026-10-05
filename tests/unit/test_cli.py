@@ -44,6 +44,14 @@ def test_build_parser_assortment_optimize_requires_a_target() -> None:
         parser.parse_args(["assortment", "optimize"])
 
 
+def test_build_parser_supply_run() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["supply", "run", "--date", "2026-06-01"])
+    assert args.subcommand == "supply"
+    assert args.supply_command == "run"
+    assert args.date == date(2026, 6, 1)
+
+
 def test_build_parser_db_migrate_custom_dir() -> None:
     parser = build_parser()
     args = parser.parse_args(["db", "migrate", "--migrations-dir", "custom/path"])

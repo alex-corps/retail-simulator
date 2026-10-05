@@ -87,3 +87,35 @@ def insert_snapshot(conn: Connection[Any], day: date, stock: Mapping[StockKey, i
     if not rows:
         return
     copy_rows(conn, "daily_opening_stock", _SNAPSHOT_COLUMNS, rows)
+
+
+def positive_stock_days(
+    conn: Connection[Any],
+    location_ids: Sequence[int],
+    date_from: date,
+    date_to: date,
+) -> dict[StockKey, set[date]]:
+    # Дни, в которые остаток на начало дня был больше нуля. Нулевые снимки не считаются.
+    if not location_ids or date_from > date_to:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT storage_location_id, product_id, stock_date
+            FROM daily_opening_stock
+            WHERE stock_date BETWEEN %(date_from)s AND %(date_to)s
+              AND quantity > 0
+              AND storage_location_id = ANY(%(location_ids)s)
+            """,
+            {
+                "location_ids": list(location_ids),
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+        )
+        rows = cur.fetchall()
+    days: dict[StockKey, set[date]] = {}
+    for location_id, product_id, stock_date in rows:
+        key = (int(location_id), int(product_id))
+        days.setdefault(key, set()).add(cast("date", stock_date))
+    return days

@@ -11,6 +11,7 @@ from retail_sim.db.migrate import apply_migrations
 from retail_sim.domain.enums import OptimizationFlag
 from retail_sim.repositories.stores import StoreNotFoundError, list_stores, set_optimization_flag
 from retail_sim.steps.s0_opening_stock import run_opening_stock
+from retail_sim.steps.s1_supplier import run_supplier
 from retail_sim.steps.s2_assortment import run_assortment
 
 
@@ -55,6 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_target.add_argument("--store-id", type=int, nargs="+")
     optimize_target.add_argument("--all", action="store_true")
 
+    supply_parser = subparsers.add_parser("supply", help="Supplier receipt commands")
+    supply_subparsers = supply_parser.add_subparsers(dest="supply_command", required=True)
+    run_supply_parser = supply_subparsers.add_parser(
+        "run",
+        help="Receive supplier goods for one day (opening stock, then receipts)",
+    )
+    run_supply_parser.add_argument("--date", type=date.fromisoformat, required=True)
+
     return parser
 
 
@@ -79,6 +88,20 @@ def handle_assortment_build(args: argparse.Namespace) -> int:
         f"Built assortment for {result.stores_filled} store(s), "
         f"optimized {result.stores_optimized} store(s), "
         f"returned {result.skus_returned} SKU(s) to the warehouse."
+    )
+    return 0
+
+
+def handle_supply_run(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    with get_connection(settings) as conn, conn.transaction():
+        stock = run_opening_stock(conn, args.date)
+        result = run_supplier(conn, args.date, stock)
+    kind = "Cold start" if result.cold_start else "Supplier receipts"
+    print(
+        f"{kind}: {result.warehouses_supplied} warehouse(s), "
+        f"{result.skus_received} SKU line(s), "
+        f"{result.units_received} unit(s)."
     )
     return 0
 
@@ -110,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
         return handle_assortment_build(args)
     if args.subcommand == "assortment" and args.assortment_command == "optimize":
         return handle_assortment_optimize(args)
+    if args.subcommand == "supply" and args.supply_command == "run":
+        return handle_supply_run(args)
 
     return 0
 

@@ -1,0 +1,16 @@
+# Role & Tech Stack
+- Senior Python Engineer. Production-ready, modular, strictly-typed code (Python 3.11+).
+- Use `uv` for dependencies and scripts (`uv run`, `uv add`). Never use plain pip/poetry.
+- Always add `from __future__ import annotations` as first import. Use PEP 585/604 types (`list[str]`, `T | None`).
+
+# Zero-Assumption Policy
+- If business logic, rounding, NULLs, or edge cases are unclear, STOP and ask. Never guess.
+
+# Scope & Constraints (Do NOT)
+- Modify ONLY requested files/functions. Never refactor adjacent code or configs unprompted.
+- Never add or bump dependencies without explicit instruction.
+- Never use placeholder comments (`# TODO`, `# implement later`). Write full logic for the requested scope.
+
+# Output Efficiency
+- Be concise: no pleasantries, no conversational filler, no unsolicited post-explanations.
+- Never rewrite entire files for small edits. Return targeted diffs or functions only.

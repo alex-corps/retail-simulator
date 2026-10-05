@@ -154,11 +154,11 @@ retail-simulator/
 
 ### Stock retention (alg)
 
-Relative to simulation “today”:
+`k` is the age in days: simulation day minus `stock_date`. Only nonzero quantities are stored. A day with no rows is not a zero snapshot: opening stock is `snapshot(s) + Σ movements` on `[s, day)`, where `s` is the latest stored snapshot before that day. With no earlier snapshot, `s` is absent and every movement before that day is summed.
 
-- last 21 days: daily snapshots
-- days −70 … −22: keep week-start only (Monday)
-- before −71: keep month-start only
+- `k <= 21`: every day
+- `22 <= k <= 70`: Mondays and the 1st of each month
+- `k >= 71`: the 1st of each month only
 
 ---
 
@@ -208,8 +208,8 @@ Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`).
 |------|--------|--------|
 | 1 | Infra: uv, compose, config, migrate runner, CLI skeleton, ruff/mypy/pytest | Done |
 | 2 | DDL (constraints/indexes), domain enums/models, read repositories, schema tests | Done |
-| 3 | Opening stock engine + in-memory `DayStock` | Next |
-| 4 | Store factory + assortment | Pending |
+| 3 | Opening stock engine + in-memory `DayStock` | Done |
+| 4 | Store factory + assortment | Next |
 | 5 | Supplier receipts | Pending |
 | 6 | Warehouse→store + deficit allocation | Pending |
 | 7 | Receipt generation + COPY + benchmarks | Pending |

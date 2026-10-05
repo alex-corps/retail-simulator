@@ -73,7 +73,7 @@ retail-simulator/
   .env.example
   architecture.mdc              # this document
   retail-simulator-*.txt        # business specs
-  migrations/                   # 0001_init.sql, 0002_schema.sql, 0003_receipts_ts_index.sql
+  migrations/                   # 0001_init.sql … 0004_simulation_runs.sql
   src/retail_sim/
     config.py
     cli.py                      # db migrate | assortment | supply | replenish | sales
@@ -94,19 +94,23 @@ retail-simulator/
       stock.py                  # DayStock, NegativeStockError
       retention.py              # which opening-stock dates to keep
     repositories/
-      products.py stores.py movements.py stock.py params.py locations.py receipts.py
+      products.py stores.py movements.py stock.py params.py locations.py receipts.py runs.py
     steps/
       s0_opening_stock.py
       s1_supplier.py
       s2_assortment.py
       s3_replenish.py           # rollback_replenish + run_replenish
       s4_sales.py               # rollback_sales + run_sales
+    simulation/
+      day_runner.py             # one day, one transaction
+      period_runner.py          # date range, journal, resume
+      invariants.py
   tests/
     unit/
     integration/
 ```
 
-Not in the tree yet (later steps): `core/store_factory.py`, `simulation/day_runner.py`, `simulation/period_runner.py`, `simulation/invariants.py`.
+Not in the tree yet (later steps): `core/promo.py`, `repositories/promo.py`, `core/store_factory.py`, `web/`.
 
 ---
 
@@ -115,7 +119,7 @@ Not in the tree yet (later steps): `core/store_factory.py`, `simulation/day_runn
 ### Ownership
 
 - `(man)` — filled manually: products, storage locations, warehouses, calculation parameters, store name pool; stores may be man or alg.
-- `(alg)` — written by simulator: assortment, opening stock, movements, receipts, receipt lines.
+- `(alg)` — written by simulator: assortment, opening stock, movements, receipts, receipt lines, simulation runs.
 
 ### Physical table names (snake_case)
 
@@ -132,6 +136,7 @@ Not in the tree yet (later steps): `core/store_factory.py`, `simulation/day_runn
 | Движение товара | `inventory_movements` |
 | Чеки | `receipts` |
 | Чеки, товары | `receipt_lines` |
+| Прогоны расчёта | `simulation_runs` |
 
 ### Critical schema rules
 
@@ -152,6 +157,7 @@ Not in the tree yet (later steps): `core/store_factory.py`, `simulation/day_runn
 - `receipt_lines` PK is `(receipt_id, product_id)`, so a SKU taken more than once on one receipt is a single row. `sale_price` is the product retail price. `discount_pct` and `clearance_flag` default to 0; S4 never sets them.
 - Receipt indexes: `idx_receipts_store_ts (store_id, receipt_ts)`, `idx_receipts_ts (receipt_ts)`. Deleting a day uses a half-open `receipt_ts` range so `idx_receipts_ts` applies. COPY into `receipts` passes `id` explicitly (`nextval` first), because COPY does not return generated ids.
 - Optimization flag: `0` idle, `1` requested, `2` completed (set manually to `1`).
+- `simulation_runs` is one row per period run (history is not overwritten). Progress is `days_done` / `days_total`. The last committed day is `last_done_date`: the column is not named `current_date` because that word is reserved in PostgreSQL.
 - Continuity: prefer `max(stock_date)` from `daily_opening_stock` over max movement date.
 
 ### Stock retention (alg)
@@ -166,7 +172,7 @@ Not in the tree yet (later steps): `core/store_factory.py`, `simulation/day_runn
 
 ## Daily Simulation Pipeline
 
-One day = one DB transaction. Period = loop over days. Re-running a day removes that day's sales first, then that day's warehouse→store transfers, before supplier receipts are recalculated. Sales come off first: reversing a shipment of units already sold would drive store stock negative. `sales run` does this inside the day transaction; `replenish run` still removes only that day's transfers. A period runner must keep the same order.
+One day = one DB transaction, opened inside `run_day` (`simulation/day_runner.py`), not around the whole period. Each day commits before the period runner writes progress, so `days_done` is visible while the run is still going. `advance_run` and `finish_run` use their own transaction. Re-running a day removes that day's sales first, then that day's warehouse→store transfers, before supplier receipts are recalculated. Sales come off first: reversing a shipment of units already sold would drive store stock negative. `sales run` calls `run_day`. `replenish run` still removes only that day's transfers. `simulate` keeps the same order. Invariants run at the end of the day transaction; `InvariantError` rolls that day back and marks the journal row `failed`. `simulate --resume` starts at `last_done_date + 1` of the latest `running` row when that date is set; otherwise it recalculates `max(stock_date)` when that snapshot is on or after `--from`.
 
 ```
 PeriodRunner
@@ -201,14 +207,16 @@ retail-sim assortment build --date DATE          # S0, then S2
 retail-sim assortment optimize (--store-id ID... | --all)   # sets flag to 1
 retail-sim supply run --date DATE                # S0, then S1
 retail-sim replenish run --date DATE             # S0, drop S3, S1, S2, S3
-retail-sim sales run --date DATE                 # S0, drop S4, drop S3, S1, S2, S3, S4
+retail-sim sales run --date DATE                 # run_day: S0 … S4, then invariants
+retail-sim simulate --from DATE --to DATE [--resume] [--no-journal]
 ```
 
 Still target:
 
 ```text
+retail-sim promo add --from DATE --to DATE --factor FACTOR (--store-id ID... | --all)
+retail-sim web [--host HOST] [--port PORT]
 retail-sim stores add N
-retail-sim simulate --from DATE --to DATE
 ```
 
 Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`). Optimization flag `1` may also be set directly in `stores`.
@@ -226,9 +234,12 @@ Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`). Optimization flag 
 | 5 | Supplier receipts | Done |
 | 6 | Warehouse→store + deficit allocation | Done |
 | 7 | Receipt generation + COPY | Done |
-| 8 | Period runner, invariants, resume-from-date | Pending |
+| 8 | Period runner, invariants, resume-from-date, `simulation_runs` | Done |
+| 9 | Sale periods and discount-elastic sales (`price_factor^(1-E)`, E=1.5) | Pending |
+| 10 | Web panel (FastAPI + Jinja2): run a period, promo, optimization flag, history | Pending |
+| 11 | Store creation (`stores add`) | Pending |
 
-Store creation from the logic file (`stores add`, names from `store_name_pool`, hours and capacity) is not implemented. `list_unused_store_names` is the only piece in place.
+`list_unused_store_names` is already in place for step 11. Sale periods and the panel are specified in `retail-simulator-logic add1.txt`: overlapping promos for one store take the largest discount (smallest `price_factor`).
 
 ---
 

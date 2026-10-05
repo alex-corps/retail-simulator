@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from retail_sim.domain.enums import LocationType, OperationType, OptimizationFlag
+from retail_sim.domain.enums import LocationType, OperationType, OptimizationFlag, RunStatus
 from retail_sim.domain.models import (
     CalculationParameters,
     InventoryMovement,
@@ -8,6 +8,7 @@ from retail_sim.domain.models import (
     Product,
     Receipt,
     ReceiptLine,
+    SimulationRun,
     StorageLocation,
     Store,
     StoreAssortmentItem,
@@ -24,6 +25,8 @@ __all__ = [
     "Product",
     "Receipt",
     "ReceiptLine",
+    "RunStatus",
+    "SimulationRun",
     "StorageLocation",
     "Store",
     "StoreAssortmentItem",

@@ -4,17 +4,22 @@ import argparse
 import sys
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from retail_sim.config import get_settings
 from retail_sim.db.connection import get_connection
 from retail_sim.db.migrate import apply_migrations
 from retail_sim.domain.enums import OptimizationFlag
 from retail_sim.repositories.stores import StoreNotFoundError, list_stores, set_optimization_flag
+from retail_sim.simulation.day_runner import run_day
+from retail_sim.simulation.period_runner import resume_start_date, run_period
 from retail_sim.steps.s0_opening_stock import run_opening_stock
 from retail_sim.steps.s1_supplier import run_supplier
 from retail_sim.steps.s2_assortment import run_assortment
 from retail_sim.steps.s3_replenish import rollback_replenish, run_replenish
-from retail_sim.steps.s4_sales import rollback_sales, run_sales
+
+if TYPE_CHECKING:
+    from retail_sim.simulation.day_runner import DayResult
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +89,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sell for one day (opening stock, supply, assortment, replenishment, receipts)",
     )
     run_sales_parser.add_argument("--date", type=date.fromisoformat, required=True)
+
+    simulate_parser = subparsers.add_parser(
+        "simulate",
+        help="Run the daily pipeline for a date range",
+    )
+    simulate_parser.add_argument("--from", dest="date_from", type=date.fromisoformat, required=True)
+    simulate_parser.add_argument("--to", dest="date_to", type=date.fromisoformat, required=True)
+    simulate_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from an unfinished run or the latest opening-stock date",
+    )
+    simulate_parser.add_argument(
+        "--no-journal",
+        action="store_true",
+        help="Do not write a simulation_runs row",
+    )
 
     return parser
 
@@ -158,15 +180,12 @@ def handle_replenish_run(args: argparse.Namespace) -> int:
 
 def handle_sales_run(args: argparse.Namespace) -> int:
     settings = get_settings()
-    with get_connection(settings) as conn, conn.transaction():
-        stock = run_opening_stock(conn, args.date)
-        # Продажи снимаем первыми: иначе откат отгрузки уведёт остаток магазина в минус.
-        rollback_sales(conn, args.date, stock)
-        rollback_replenish(conn, args.date, stock)
-        supplier = run_supplier(conn, args.date, stock)
-        assortment = run_assortment(conn, args.date, stock, settings.seed)
-        replenish = run_replenish(conn, args.date, stock)
-        sales = run_sales(conn, args.date, stock, settings.seed)
+    with get_connection(settings) as conn:
+        result = run_day(conn, args.date, settings.seed)
+    supplier = result.supplier
+    assortment = result.assortment
+    replenish = result.replenish
+    sales = result.sales
     kind = "Cold start" if supplier.cold_start else "Supplier receipts"
     print(
         f"{kind}: {supplier.warehouses_supplied} warehouse(s), "
@@ -190,6 +209,41 @@ def handle_sales_run(args: argparse.Namespace) -> int:
         f"{sales.lines_created} line(s), "
         f"{sales.units_sold} unit(s), "
         f"{sales.revenue} RUB."
+    )
+    return 0
+
+
+def _print_simulated_day(result: DayResult) -> None:
+    print(
+        f"{result.day.isoformat()}: {result.sales.receipts_created} receipt(s), "
+        f"{result.sales.units_sold} unit(s), "
+        f"{result.sales.revenue} RUB."
+    )
+
+
+def handle_simulate(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    with get_connection(settings) as conn:
+        start = resume_start_date(conn, args.date_from) if args.resume else args.date_from
+        if start > args.date_to:
+            print(
+                f"Nothing to simulate: {start.isoformat()} is after {args.date_to.isoformat()}."
+            )
+            return 0
+        result = run_period(
+            conn,
+            start,
+            args.date_to,
+            settings.seed,
+            journal=not args.no_journal,
+            on_day=_print_simulated_day,
+        )
+    print(
+        f"Period {start.isoformat()}..{args.date_to.isoformat()}: "
+        f"{result.days} day(s), "
+        f"{result.receipts_created} receipt(s), "
+        f"{result.units_sold} unit(s), "
+        f"{result.revenue} RUB."
     )
     return 0
 
@@ -227,6 +281,8 @@ def main(argv: list[str] | None = None) -> int:
         return handle_replenish_run(args)
     if args.subcommand == "sales" and args.sales_command == "run":
         return handle_sales_run(args)
+    if args.subcommand == "simulate":
+        return handle_simulate(args)
 
     return 0
 

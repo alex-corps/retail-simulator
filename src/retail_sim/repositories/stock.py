@@ -20,6 +20,15 @@ _SNAPSHOT_COLUMNS = (
 )
 
 
+def get_latest_snapshot_date(conn: Connection[Any]) -> date | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(stock_date) FROM daily_opening_stock")
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return cast("date", row[0])
+
+
 def get_latest_snapshot_date_before(conn: Connection[Any], day: date) -> date | None:
     with conn.cursor() as cur:
         cur.execute(

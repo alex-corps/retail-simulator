@@ -7,7 +7,7 @@ if TYPE_CHECKING:
     from datetime import date, datetime, time
     from decimal import Decimal
 
-    from retail_sim.domain.enums import LocationType, OperationType, OptimizationFlag
+    from retail_sim.domain.enums import LocationType, OperationType, OptimizationFlag, RunStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,3 +102,18 @@ class ReceiptLine:
     sale_price: Decimal
     discount_pct: Decimal
     clearance_flag: int
+
+
+@dataclass(frozen=True, slots=True)
+class SimulationRun:
+    id: int
+    date_from: date
+    date_to: date
+    days_total: int
+    days_done: int
+    last_done_date: date | None
+    status: RunStatus
+    seed: int
+    error_message: str | None
+    started_at: datetime
+    finished_at: datetime | None

@@ -7,7 +7,7 @@ import psycopg
 import pytest
 from psycopg import Connection
 
-from retail_sim.domain.enums import LocationType, OperationType, OptimizationFlag
+from retail_sim.domain.enums import LocationType, OperationType, OptimizationFlag, RunStatus
 from tests.conftest import is_db_reachable
 from tests.integration.helpers import (
     insert_calculation_parameters,
@@ -28,6 +28,7 @@ EXPECTED_TABLES = {
     "inventory_movements",
     "receipts",
     "receipt_lines",
+    "simulation_runs",
 }
 
 EXPECTED_INDEXES = {
@@ -35,6 +36,7 @@ EXPECTED_INDEXES = {
     "idx_inventory_movements_op_date_location_product",
     "idx_receipts_store_ts",
     "idx_receipts_ts",
+    "idx_simulation_runs_started_at",
 }
 
 pytestmark = pytest.mark.skipif(
@@ -88,6 +90,10 @@ def test_check_constraints_match_enums(db_conn: Connection[Any]) -> None:
     for flag in OptimizationFlag:
         assert str(int(flag)) in compact_flag_def
 
+    status_def = _constraint_def(db_conn, "simulation_runs_status_check")
+    for status in RunStatus:
+        assert status.value in status_def
+
 
 def _expect_violation(
     conn: Connection[Any],
@@ -100,6 +106,9 @@ def _expect_violation(
 
 
 def test_calculation_parameters_rejects_second_row(db_conn: Connection[Any]) -> None:
+    # Строка id=1 может быть уже загружена оператором. Удаление живёт в транзакции теста.
+    with db_conn.cursor() as cur:
+        cur.execute("DELETE FROM calculation_parameters")
     insert_calculation_parameters(db_conn)
     _expect_violation(
         db_conn,

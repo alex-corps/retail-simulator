@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from retail_sim.domain.enums import LocationType, OperationType, OptimizationFlag
+from retail_sim.domain.enums import LocationType, OperationType, OptimizationFlag, RunStatus
 
 
 def test_location_type_values() -> None:
@@ -14,6 +14,13 @@ def test_operation_type_values() -> None:
     assert OperationType.TRANSFER.value == "перемещение"
     assert OperationType.SALE.value == "продажа"
     assert {item.value for item in OperationType} == {"приход", "перемещение", "продажа"}
+
+
+def test_run_status_values() -> None:
+    assert RunStatus.RUNNING.value == "running"
+    assert RunStatus.COMPLETED.value == "completed"
+    assert RunStatus.FAILED.value == "failed"
+    assert {item.value for item in RunStatus} == {"running", "completed", "failed"}
 
 
 def test_optimization_flag_values() -> None:

@@ -18,3 +18,9 @@ class OptimizationFlag(IntEnum):
     IDLE = 0
     REQUESTED = 1
     COMPLETED = 2
+
+
+class RunStatus(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"

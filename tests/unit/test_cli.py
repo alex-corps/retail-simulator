@@ -570,6 +570,34 @@ def test_main_dispatches_promo_add(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen == [Decimal("0.8")]
 
 
+def test_build_parser_web_defaults() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["web"])
+    assert args.subcommand == "web"
+    assert args.host == "127.0.0.1"
+    assert args.port == 8000
+
+
+def test_build_parser_web_host_and_port() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["web", "--host", "0.0.0.0", "--port", "9000"])
+    assert args.host == "0.0.0.0"
+    assert args.port == 9000
+
+
+def test_main_dispatches_web(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def handler(args: argparse.Namespace) -> int:
+        seen["host"] = args.host
+        seen["port"] = args.port
+        return 0
+
+    monkeypatch.setattr("retail_sim.cli.handle_web", handler)
+    assert main(["web"]) == 0
+    assert seen == {"host": "127.0.0.1", "port": 8000}
+
+
 def test_build_parser_db_migrate_custom_dir() -> None:
     parser = build_parser()
     args = parser.parse_args(["db", "migrate", "--migrations-dir", "custom/path"])

@@ -131,12 +131,16 @@ def list_runs(conn: Connection[Any], limit: int = 50) -> list[SimulationRun]:
     )
 
 
-def get_active_run(conn: Connection[Any]) -> SimulationRun | None:
-    rows = _fetch_runs(
+def list_running_runs(conn: Connection[Any]) -> list[SimulationRun]:
+    return _fetch_runs(
         conn,
-        "WHERE status = %s ORDER BY started_at DESC, id DESC LIMIT 1",
+        "WHERE status = %s ORDER BY started_at DESC, id DESC",
         (str(RunStatus.RUNNING),),
     )
+
+
+def get_active_run(conn: Connection[Any]) -> SimulationRun | None:
+    rows = list_running_runs(conn)
     if not rows:
         return None
     return rows[0]

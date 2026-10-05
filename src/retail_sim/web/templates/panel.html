@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Панель симулятора</title>
+  <style>
+    body { font-family: sans-serif; max-width: 960px; margin: 2rem auto; line-height: 1.45; color: #1c1c1c; }
+    h1 { font-size: 1.5rem; }
+    section { margin: 0 0 2rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #ccc; text-align: left; padding: 0.35rem 0.5rem; vertical-align: top; }
+    label { display: block; margin: 0.45rem 0; }
+    .error { color: #8a1f1f; }
+    .note { color: #444; }
+    button:disabled { opacity: 0.55; }
+  </style>
+</head>
+<body{% if start_blocked %} data-poll="1"{% endif %}>
+  <h1>Панель симулятора</h1>
+  {% if error %}
+  <p class="error">{{ error }}</p>
+  {% endif %}
+
+  <section>
+    <h2>Расчёт за период</h2>
+    <p class="note">Повторный запуск на уже посчитанные даты пересчитывает эти дни.</p>
+    <p id="run-progress">{{ progress }}</p>
+    <p id="run-error" class="error"{% if not run_error %} hidden{% endif %}>{{ run_error or "" }}</p>
+    <p id="thread-error" class="error"{% if not thread_error %} hidden{% endif %}>{{ thread_error or "" }}</p>
+    <form id="abort-form" method="post" action="/runs/abort"{% if not abort_run_id %} hidden{% endif %}>
+      <p class="note">В базе есть незавершённый прогон, а эта панель его не считает. Не нажимайте, пока расчёт идёт в другом терминале: строка будет помечена ошибкой, а тот процесс продолжит писать дни.</p>
+      <button type="submit">Пометить прерванным</button>
+    </form>
+    <form method="post" action="/simulate">
+      <label>Дата с <input type="date" name="date_from" required></label>
+      <label>Дата по <input type="date" name="date_to" required></label>
+      <button id="start-button" type="submit"{% if start_blocked %} disabled{% endif %}>Запустить расчёт</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Периоды распродаж</h2>
+    <form method="post" action="/promo">
+      <label>Дата с <input type="date" name="date_from" required></label>
+      <label>Дата по <input type="date" name="date_to" required></label>
+      <label>Коэффициент цены <input name="factor" inputmode="decimal" required placeholder="0,8">
+        <span class="note">0,8 — скидка 20%, доля розничной цены</span>
+      </label>
+      <label>Id магазинов <textarea name="store_ids" rows="3" placeholder="3, 8, 12"></textarea></label>
+      <label><input type="checkbox" name="all_stores" value="on"> Все магазины</label>
+      <button type="submit">Добавить период</button>
+    </form>
+    {% if periods %}
+    <table>
+      <thead>
+        <tr><th>Дата с</th><th>Дата по</th><th>Коэффициент</th><th>Магазины</th></tr>
+      </thead>
+      <tbody>
+        {% for period in periods %}
+        <tr>
+          <td>{{ period.date_from }}</td>
+          <td>{{ period.date_to }}</td>
+          <td>{{ period.price_factor }}</td>
+          <td>{{ period.store_ids | join(", ") }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p>Периодов распродаж нет.</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>Оптимизация ассортимента</h2>
+    {% if stores %}
+    <form method="post" action="/optimize">
+      <table>
+        <thead>
+          <tr><th></th><th>Id</th><th>Магазин</th><th>Флаг</th></tr>
+        </thead>
+        <tbody>
+          {% for store in stores %}
+          <tr>
+            <td><input type="checkbox" name="store_id" value="{{ store.id }}"></td>
+            <td>{{ store.id }}</td>
+            <td>{{ store.name }}</td>
+            <td>{{ store.optimization_flag.value }} — {{ flag_labels[store.optimization_flag.value] }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <button type="submit">Применить оптимизацию</button>
+    </form>
+    {% else %}
+    <p>Магазинов нет.</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>Проведённые расчёты</h2>
+    <p id="runs-empty"{% if runs %} hidden{% endif %}>Проведённых расчётов нет.</p>
+    <table id="runs-table"{% if not runs %} hidden{% endif %}>
+      <thead>
+        <tr>
+          <th>Дата с</th>
+          <th>Дата по</th>
+          <th>Статус</th>
+          <th>Дни</th>
+          <th>Ошибка</th>
+        </tr>
+      </thead>
+      <tbody id="runs-body">
+        {% for run in runs %}
+        <tr>
+          <td>{{ run.date_from }}</td>
+          <td>{{ run.date_to }}</td>
+          <td>{{ status_labels[run.status.value] }}</td>
+          <td>{{ run.days_done }} / {{ run.days_total }}</td>
+          <td>{{ run.error_message or "" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  <script>
+    const poll = document.body.dataset.poll === "1";
+    function cell(text) {
+      const item = document.createElement("td");
+      item.textContent = text;
+      return item;
+    }
+    function applyStatus(data) {
+      document.getElementById("run-progress").textContent = data.progress;
+      const runError = document.getElementById("run-error");
+      runError.hidden = !data.error_message;
+      runError.textContent = data.error_message || "";
+      const threadError = document.getElementById("thread-error");
+      threadError.hidden = !data.thread_error;
+      threadError.textContent = data.thread_error || "";
+      document.getElementById("abort-form").hidden = data.abort_run_id === null;
+      document.getElementById("start-button").disabled = data.start_blocked;
+      const body = document.getElementById("runs-body");
+      body.replaceChildren();
+      for (const run of data.runs) {
+        const row = document.createElement("tr");
+        row.append(
+          cell(run.date_from),
+          cell(run.date_to),
+          cell(run.status_label),
+          cell(run.days_done + " / " + run.days_total),
+          cell(run.error_message || "")
+        );
+        body.append(row);
+      }
+      document.getElementById("runs-empty").hidden = data.runs.length > 0;
+      document.getElementById("runs-table").hidden = data.runs.length === 0;
+      document.body.dataset.poll = data.start_blocked ? "1" : "0";
+    }
+    async function tick() {
+      if (document.body.dataset.poll !== "1") return;
+      try {
+        const response = await fetch("/status");
+        if (response.ok) applyStatus(await response.json());
+      } catch (error) {
+        // Следующая попытка подтянет статус, поля ввода не трогаем.
+      }
+      if (document.body.dataset.poll === "1") setTimeout(tick, 2000);
+    }
+    if (poll) setTimeout(tick, 2000);
+  </script>
+</body>
+</html>

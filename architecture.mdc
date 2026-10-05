@@ -16,11 +16,11 @@ The operator can, today:
 - load manual reference data (the app does not generate a seed)
 - request assortment optimization (`flag = 1`; the next day that includes S2 sets it to `2`)
 - run one day (`supply`, `replenish`, `sales`) or a date range (`simulate`, with `--resume`)
-- add a sale period (`promo add`). On a covered store-day the store sells at `price_factor` of the retail price and planned day revenue is multiplied by `price_factor ** (1 - E)` (`E = 1.5`), so unit volume follows constant elasticity. Overlapping periods keep the smallest `price_factor`
+- add a sale period (`promo add` or the panel). On a covered store-day the store sells at `price_factor` of the retail price and planned day revenue is multiplied by `price_factor ** (1 - E)` (`E = 1.5`), so unit volume follows constant elasticity. Overlapping periods keep the smallest `price_factor`
+- open the panel (`web`): start a journaled period and watch `days_done` / `days_total`, add a sale period, set the optimization flag to `1`, list runs
 
 Specified, not built yet:
 
-- web panel on the same spec: start a period and read its progress, edit sale periods, set the optimization flag, list finished runs
 - store creation (`stores add` in `retail-simulator-logic.txt`)
 
 Reference manuals (source of truth for business rules):
@@ -44,6 +44,7 @@ Reference manuals (source of truth for business rules):
 | Migrations | numbered `.sql` + custom runner | table `schema_migrations`; each file commits on its own. The runner commits the read of applied versions first, so a migration is not a savepoint that `close()` would roll back |
 | Config | `pydantic-settings` | `.env` / env vars |
 | CLI | `argparse` | entry point `retail-sim` |
+| Web | FastAPI + Jinja2 | `retail-sim web`, one process |
 | RNG | stdlib `random` | seeded `Random` from `(global seed, stream, date, store_id)`; `numpy` is not a dependency |
 | Quality | `ruff`, `mypy --strict`, `pytest` | unit + integration |
 
@@ -52,7 +53,7 @@ Reference manuals (source of truth for business rules):
 ## Layering Rules
 
 ```
-CLI → simulation/ (period/day) → steps/ → core/ + repositories/ → PostgreSQL
+CLI or web → simulation/ (period/day) → steps/ → core/ + repositories/ → PostgreSQL
 ```
 
 | Package | Responsibility | May talk to DB? |
@@ -61,6 +62,7 @@ CLI → simulation/ (period/day) → steps/ → core/ + repositories/ → Postgr
 | `repositories/` | SQL only; map rows ↔ domain models | **Yes** |
 | `steps/` | Orchestrate one daily step: load → `core` → write | **Via repos** |
 | `simulation/` | Day/period runners, invariants, progress | **Via steps/repos** |
+| `web/` | Operator panel: forms, one background period job, Jinja page | **Via repos and `run_period`** |
 | `domain/` | Enums + frozen dataclasses | **No** |
 | `db/` | Connection, migrations, COPY helpers | **Yes** |
 
@@ -80,7 +82,7 @@ retail-simulator/
   migrations/                   # 0001_init.sql … 0005_sale_periods.sql
   src/retail_sim/
     config.py
-    cli.py                      # db | assortment | supply | replenish | sales | simulate | promo
+    cli.py                      # db | assortment | supply | replenish | sales | simulate | promo | web
     rng.py                      # seeded Random(global seed, stream, date, store_id)
     db/
       connection.py
@@ -110,12 +112,17 @@ retail-simulator/
       day_runner.py             # one day, one transaction
       period_runner.py          # date range, journal, resume
       invariants.py
+    web/
+      app.py                    # FastAPI routes, one page
+      forms.py                  # dates, price factor, store id list
+      jobs.py                   # one background run_period per process
+      templates/panel.html
   tests/
     unit/
     integration/
 ```
 
-Not in the tree yet (later steps): `core/store_factory.py`, `web/`.
+Not in the tree yet (later steps): `core/store_factory.py`.
 
 ---
 
@@ -218,12 +225,12 @@ retail-sim replenish run --date DATE             # S0, drop S3, S1, S2, S3
 retail-sim sales run --date DATE                 # run_day: S0 … S4, then invariants
 retail-sim simulate --from DATE --to DATE [--resume] [--no-journal]
 retail-sim promo add --from DATE --to DATE --factor FACTOR (--store-id ID... | --all)
+retail-sim web [--host HOST] [--port PORT]   # default 127.0.0.1:8000
 ```
 
 Still target:
 
 ```text
-retail-sim web [--host HOST] [--port PORT]
 retail-sim stores add N
 ```
 
@@ -244,10 +251,10 @@ Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`). Optimization flag 
 | 7 | Receipt generation + COPY | Done |
 | 8 | Period runner, invariants, resume-from-date, `simulation_runs` | Done |
 | 9 | Sale periods and discount-elastic sales (`price_factor^(1-E)`, E=1.5) | Done |
-| 10 | Web panel (FastAPI + Jinja2): run a period, promo, optimization flag, history | Pending |
+| 10 | Web panel (FastAPI + Jinja2): run a period, promo, optimization flag, history | Done |
 | 11 | Store creation (`stores add`) | Pending |
 
-`list_unused_store_names` is already in place for step 11. Sale periods live in `sale_periods` / `sale_period_stores`; overlapping promos for one store take the largest discount (smallest `price_factor`). The panel remains specified in `retail-simulator-logic add1.txt`.
+`list_unused_store_names` is already in place for step 11. Sale periods live in `sale_periods` / `sale_period_stores`; overlapping promos for one store take the largest discount (smallest `price_factor`). The panel adds a period and lists them; it does not edit or delete. `web` starts `run_period` with the journal in one background thread and will not start another while any `simulation_runs` row is `running`. While a run blocks a new start, the page polls `GET /status` and updates only the progress block; it does not reload the document, so typed dates stay. A row left `running` after the panel process died can be marked failed from the page. That button finishes every `running` row in one transaction (the read and `finish_run` together; a `SELECT` that already opened a transaction makes `conn.transaction()` a savepoint, and `close()` would roll the update back). It is not for a `simulate` that is still writing. Starting a range recalculates those days (same as `simulate` without `--resume`).
 
 ---
 

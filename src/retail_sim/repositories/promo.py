@@ -46,6 +46,39 @@ def insert_sale_period(
     )
 
 
+def list_sale_periods(conn: Connection[Any]) -> list[SalePeriod]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                periods.id,
+                periods.date_from,
+                periods.date_to,
+                periods.price_factor,
+                COALESCE(
+                    array_agg(link.store_id ORDER BY link.store_id)
+                        FILTER (WHERE link.store_id IS NOT NULL),
+                    '{}'
+                ) AS store_ids
+            FROM sale_periods AS periods
+            LEFT JOIN sale_period_stores AS link ON link.sale_period_id = periods.id
+            GROUP BY periods.id
+            ORDER BY periods.date_from, periods.id
+            """
+        )
+        rows = cur.fetchall()
+    return [
+        SalePeriod(
+            id=int(period_id),
+            date_from=date_from,
+            date_to=date_to,
+            price_factor=Decimal(price_factor),
+            store_ids=tuple(int(store_id) for store_id in store_ids),
+        )
+        for period_id, date_from, date_to, price_factor, store_ids in rows
+    ]
+
+
 def effective_price_factors(conn: Connection[Any], day: date) -> dict[int, Decimal]:
     # Пересечения не сливаются заранее: на день берётся наибольшая скидка.
     with conn.cursor() as cur:

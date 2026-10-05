@@ -129,6 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
     promo_target.add_argument("--store-id", type=int, nargs="+")
     promo_target.add_argument("--all", action="store_true")
 
+    web_parser = subparsers.add_parser("web", help="Open the operator panel")
+    web_parser.add_argument("--host", default="127.0.0.1")
+    web_parser.add_argument("--port", type=int, default=8000)
+
     return parser
 
 
@@ -324,6 +328,16 @@ def handle_assortment_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_web(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from retail_sim.web.app import create_app
+
+    settings = get_settings()
+    uvicorn.run(create_app(settings), host=args.host, port=args.port)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -344,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
         return handle_simulate(args)
     if args.subcommand == "promo" and args.promo_command == "add":
         return handle_promo_add(args)
+    if args.subcommand == "web":
+        return handle_web(args)
 
     return 0
 

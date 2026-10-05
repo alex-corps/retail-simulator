@@ -9,7 +9,11 @@ from psycopg import Connection
 
 from retail_sim.core.promo import InvalidPriceFactorError
 from retail_sim.core.stock import DayStock
-from retail_sim.repositories.promo import effective_price_factors, insert_sale_period
+from retail_sim.repositories.promo import (
+    effective_price_factors,
+    insert_sale_period,
+    list_sale_periods,
+)
 from retail_sim.repositories.stores import StoreNotFoundError
 from retail_sim.steps.s4_sales import run_sales
 from tests.integration.helpers import (
@@ -147,6 +151,23 @@ def test_insert_sale_period_rejects_bad_input(db_conn: Connection[Any]) -> None:
         row = cur.fetchone()
     assert row is not None
     assert int(row[0]) == 0
+
+
+def test_list_sale_periods_returns_dates_factor_and_stores(db_conn: Connection[Any]) -> None:
+    _isolate(db_conn)
+    assert list_sale_periods(db_conn) == []
+
+    first_id, _first_location = _store(db_conn, "Первый")
+    second_id, _second_location = _store(db_conn, "Второй")
+    insert_sale_period(db_conn, MONDAY, TUESDAY, Decimal("0.8"), [second_id, first_id])
+    insert_sale_period(db_conn, TUESDAY, TUESDAY, Decimal("0.5"), [first_id])
+
+    periods = list_sale_periods(db_conn)
+    listed = [(item.date_from, item.date_to, item.price_factor, item.store_ids) for item in periods]
+    assert listed == [
+        (MONDAY, TUESDAY, Decimal("0.8000"), (first_id, second_id)),
+        (TUESDAY, TUESDAY, Decimal("0.5000"), (first_id,)),
+    ]
 
 
 def test_effective_factor_uses_smallest_and_inclusive_dates(db_conn: Connection[Any]) -> None:

@@ -40,7 +40,7 @@ Reference manuals (source of truth for business rules):
 | Migrations | numbered `.sql` + custom runner | table `schema_migrations` |
 | Config | `pydantic-settings` | `.env` / env vars |
 | CLI | `argparse` | entry point `retail-sim` |
-| RNG / sales vectors | `numpy` (later steps) | seeded `Generator` for reproducibility |
+| RNG | stdlib `random` | seeded `Random` from `(global seed, stream, date, store_id)`; `numpy` is not a dependency |
 | Quality | `ruff`, `mypy --strict`, `pytest` | unit + integration |
 
 ---
@@ -73,11 +73,11 @@ retail-simulator/
   .env.example
   architecture.mdc              # this document
   retail-simulator-*.txt        # business specs
-  migrations/                   # 0001_*.sql, 0002_*.sql, ...
+  migrations/                   # 0001_init.sql, 0002_schema.sql, 0003_receipts_ts_index.sql
   src/retail_sim/
     config.py
-    cli.py                      # db migrate | stores add | assortment optimize | simulate
-    rng.py                      # seed(global, date, store_id)
+    cli.py                      # db migrate | assortment | supply | replenish | sales
+    rng.py                      # seeded Random(global seed, stream, date, store_id)
     db/
       connection.py
       migrate.py
@@ -87,27 +87,26 @@ retail-simulator/
       models.py                 # frozen dataclasses
       calendar.py               # Mon/Thu supply, Mon/Wed/Fri replenish
     core/
-      demand.py
+      demand.py                 # usage window, supplier order, store replenishment qty
       assortment.py
-      store_factory.py
-      receipts.py
-      allocation.py
+      allocation.py             # Hamilton split when the warehouse is short
+      receipts.py               # receipt amounts, timestamps, SKU fill
+      stock.py                  # DayStock, NegativeStockError
+      retention.py              # which opening-stock dates to keep
     repositories/
-      products.py stores.py movements.py stock.py receipts.py params.py locations.py
+      products.py stores.py movements.py stock.py params.py locations.py receipts.py
     steps/
       s0_opening_stock.py
       s1_supplier.py
       s2_assortment.py
-      s3_replenish.py
-      s4_sales.py
-    simulation/
-      day_runner.py             # steps 0..4 in one transaction
-      period_runner.py
-      invariants.py
+      s3_replenish.py           # rollback_replenish + run_replenish
+      s4_sales.py               # rollback_sales + run_sales
   tests/
     unit/
     integration/
 ```
+
+Not in the tree yet (later steps): `core/store_factory.py`, `simulation/day_runner.py`, `simulation/period_runner.py`, `simulation/invariants.py`.
 
 ---
 
@@ -149,6 +148,9 @@ retail-simulator/
 - Prefer `op_date DATE` (plus timestamp) on movements for range queries; index `(op_date, storage_location_id, product_id)`. `op_date` is `GENERATED ALWAYS AS (op_ts::date) STORED`; INSERT and COPY must omit it.
 - PK: `daily_opening_stock (stock_date, storage_location_id, product_id)`, `store_assortment (store_id, product_id)`.
 - `op_type ∈ ('приход','перемещение','продажа')`.
+- A sale is one `inventory_movements` row per receipt line, not a day total: `op_ts` is the receipt timestamp, `quantity` is −N, `sender_location_id` is the store location, `receiver_location_id` is NULL.
+- `receipt_lines` PK is `(receipt_id, product_id)`, so a SKU taken more than once on one receipt is a single row. `sale_price` is the product retail price. `discount_pct` and `clearance_flag` default to 0; S4 never sets them.
+- Receipt indexes: `idx_receipts_store_ts (store_id, receipt_ts)`, `idx_receipts_ts (receipt_ts)`. Deleting a day uses a half-open `receipt_ts` range so `idx_receipts_ts` applies. COPY into `receipts` passes `id` explicitly (`nextval` first), because COPY does not return generated ids.
 - Optimization flag: `0` idle, `1` requested, `2` completed (set manually to `1`).
 - Continuity: prefer `max(stock_date)` from `daily_opening_stock` over max movement date.
 
@@ -164,7 +166,7 @@ retail-simulator/
 
 ## Daily Simulation Pipeline
 
-One day = one DB transaction. Period = loop over days. Re-running a day removes that day's warehouse→store transfers before supplier receipts are recalculated. `replenish run` does this inside the day transaction; a period runner must keep the same order.
+One day = one DB transaction. Period = loop over days. Re-running a day removes that day's sales first, then that day's warehouse→store transfers, before supplier receipts are recalculated. Sales come off first: reversing a shipment of units already sold would drive store stock negative. `sales run` does this inside the day transaction; `replenish run` still removes only that day's transfers. A period runner must keep the same order.
 
 ```
 PeriodRunner
@@ -173,7 +175,7 @@ PeriodRunner
        ├─ S1 Supplier receipt (cold start 1000/sku; else Mon/Thu replenish)
        ├─ S2 Assortment (new store or flag=1; delisted SKU → return to warehouse)
        ├─ S3 Warehouse → store (Mon/Wed/Fri; deficit capped by warehouse stock)
-       ├─ S4 Sales (receipts + lines + sale movements)
+       ├─ S4 Sales (receipts + lines + one sale movement per line)
        └─ Invariants
 ```
 
@@ -183,24 +185,33 @@ PeriodRunner
 1. **Supplier** — if no movements: +1000 per SKU to each warehouse, any weekday. Else Mon/Thu: `max(0, ceil(avg * target_stock_days_warehouse − current))`. Avg is warehouse outflow to stores over `[day−21, day−1]` (negative transfer rows only; returns ignored) divided by days in that window with an outflow or opening stock > 0. No such days → avg 0, so a new SKU is not ordered. Re-running the day deletes that day's supplier receipts and recalculates; rolling back a receipt already shipped onward raises `NegativeStockError`.
 2. **Assortment** — new store: random SKUs up to capacity, even subcategory coverage. Flag=1: best SKUs by global avg sales within subcategories; return positive stock of delisted SKUs to warehouse; set flag=2.
 3. **Replenish** — Mon/Wed/Fri. Avg store sales over days with stock>0 or sales>0 in last 21 days; if avg=0 and stock=0 use `ceil` of the store assortment average. Need is `ceil(avg * target_stock_days_store − current)`, floored at 0. When current stock is 0, quantity is `max(need, round-half-up(avg))`; otherwise it is `need`. Never ship more than warehouse stock: Hamilton allocation (largest remainder; smaller `store_id` wins ties). Re-running the day deletes that day's warehouse→store transfers first. A sale of those units raises `NegativeStockError`.
-4. **Sales** — plan revenue = avg check × (store avg receipts ±20%). Emit checks until planned check totals exceed day revenue; fill with random in-stock assortment SKUs 1 unit at a time until check amount exceeded or stock empty; drop empty checks; write receipt tables + aggregated sale movements.
+4. **Sales** — plan revenue = avg check × (store avg receipts ±20%). Receipt amount is avg check × 0.5..2.0 in 70% of cases and uniform between min and max check in 30%. Emit checks until planned check totals exceed day revenue. Timestamps sit on an even slot grid inside opening hours, with jitter inside the slot. Fill with random in-stock assortment SKUs, 1 unit at a time, until the check amount is exceeded or stock is empty; the unit that crosses the amount stays on the check. Drop empty checks and stop the store once it is sold out. Write receipt tables and one sale movement per receipt line (`op_ts` is the receipt time, quantity −N, no receiver). Re-running the day deletes that day's receipts and sale movements.
 
 Store creation (admin): N new storage locations + stores; names from unused `store_name_pool`; receipts ±50% of network avg; capacity `floor((store_receipts/network_receipts)*avg_capacity)`; hours 10:00±3h … 21:00±2h.
 
 ---
 
-## CLI Surface (target)
+## CLI Surface
+
+Implemented:
 
 ```text
 retail-sim db migrate [--migrations-dir PATH]
+retail-sim assortment build --date DATE          # S0, then S2
+retail-sim assortment optimize (--store-id ID... | --all)   # sets flag to 1
+retail-sim supply run --date DATE                # S0, then S1
+retail-sim replenish run --date DATE             # S0, drop S3, S1, S2, S3
+retail-sim sales run --date DATE                 # S0, drop S4, drop S3, S1, S2, S3, S4
+```
+
+Still target:
+
+```text
 retail-sim stores add N
-retail-sim assortment optimize   # or set flag manually in DB
-retail-sim supply run --date DATE
-retail-sim replenish run --date DATE   # S0, drop S3, S1, S2, S3
 retail-sim simulate --from DATE --to DATE
 ```
 
-Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`).
+Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`). Optimization flag `1` may also be set directly in `stores`.
 
 ---
 
@@ -211,11 +222,13 @@ Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`).
 | 1 | Infra: uv, compose, config, migrate runner, CLI skeleton, ruff/mypy/pytest | Done |
 | 2 | DDL (constraints/indexes), domain enums/models, read repositories, schema tests | Done |
 | 3 | Opening stock engine + in-memory `DayStock` | Done |
-| 4 | Store factory + assortment | Done |
+| 4 | Store assortment (fill, optimize, delist returns) | Done |
 | 5 | Supplier receipts | Done |
 | 6 | Warehouse→store + deficit allocation | Done |
-| 7 | Receipt generation + COPY + benchmarks | Pending |
+| 7 | Receipt generation + COPY | Done |
 | 8 | Period runner, invariants, resume-from-date | Pending |
+
+Store creation from the logic file (`stores add`, names from `store_name_pool`, hours and capacity) is not implemented. `list_unused_store_names` is the only piece in place.
 
 ---
 
@@ -227,7 +240,8 @@ Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`).
 - Zero-assumption: if rounding, NULLs, or edge cases are unclear — **stop and ask**.
 - Prefer small targeted diffs over full-file rewrites.
 - Money in DB: `NUMERIC`; hot sales loops may use integer kopecks.
-- Day-level RNG: derive from `(global_seed, date, store_id)` for reproducible runs.
+- Day-level RNG: derive from `(global_seed, stream, date, store_id)` so a rerun is reproducible and assortment does not share a stream with sales.
+- Comments and docstrings are in Russian, and only where the business rule is not obvious from the code.
 
 ---
 

@@ -34,6 +34,7 @@ EXPECTED_INDEXES = {
     "idx_products_category_l2",
     "idx_inventory_movements_op_date_location_product",
     "idx_receipts_store_ts",
+    "idx_receipts_ts",
 }
 
 pytestmark = pytest.mark.skipif(

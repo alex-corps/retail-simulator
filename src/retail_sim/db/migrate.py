@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from psycopg import ClientCursor
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -51,7 +53,9 @@ def apply_migrations(conn: Connection[Any], migrations_dir: Path) -> list[str]:
     newly_applied: list[str] = []
     for file_path in pending_files:
         sql = file_path.read_text(encoding="utf-8")
-        with conn.transaction(), conn.cursor() as cur:
+        # ClientCursor uses the simple query protocol, so one migration file
+        # may contain more than one SQL statement.
+        with conn.transaction(), ClientCursor(conn) as cur:
             if sql.strip():
                 cur.execute(sql)
             cur.execute(

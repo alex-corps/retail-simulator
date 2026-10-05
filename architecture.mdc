@@ -1,0 +1,238 @@
+---
+description: Full project architecture for the retail inventory movement simulator
+alwaysApply: true
+---
+
+# Retail Simulator — Project Architecture
+
+## Purpose
+
+Python + PostgreSQL day-by-day simulator of a supermarket network:
+
+- supplier receipts into warehouses
+- transfers warehouse ↔ store
+- in-store sales (receipts + receipt lines)
+- all inventory effects recorded in `inventory_movements`
+
+Admin capabilities:
+
+- add / open stores
+- optimize store assortment
+- run simulation for a date range
+
+Reference manuals (source of truth for business rules):
+
+- `retail-simulator-data structure.txt` — tables; `(man)` manual, `(alg)` algorithm-filled
+- `retail-simulator-logic.txt` — daily simulation steps 0–4 and store creation
+
+**No automatic seed generation.** Manual reference data (`(man)`) is loaded by the operator. The app only creates schema and runs algorithms that write `(alg)` tables.
+
+---
+
+## Tech Stack
+
+| Layer | Choice | Notes |
+|-------|--------|--------|
+| Language | Python 3.12+ | `from __future__ import annotations`; PEP 585/604 types |
+| Package / run | `uv` | `uv run`, `uv add` — never plain pip/poetry |
+| DB | PostgreSQL 16 | `docker-compose.yml` |
+| DB access | psycopg 3 + raw SQL | no ORM; use `cursor.copy()` for bulk inserts |
+| Migrations | numbered `.sql` + custom runner | table `schema_migrations` |
+| Config | `pydantic-settings` | `.env` / env vars |
+| CLI | `argparse` | entry point `retail-sim` |
+| RNG / sales vectors | `numpy` (later steps) | seeded `Generator` for reproducibility |
+| Quality | `ruff`, `mypy --strict`, `pytest` | unit + integration |
+
+---
+
+## Layering Rules
+
+```
+CLI → simulation/ (period/day) → steps/ → core/ + repositories/ → PostgreSQL
+```
+
+| Package | Responsibility | May talk to DB? |
+|---------|----------------|-----------------|
+| `core/` | Pure business functions (demand, assortment, receipts, allocation) | **No** |
+| `repositories/` | SQL only; map rows ↔ domain models | **Yes** |
+| `steps/` | Orchestrate one daily step: load → `core` → write | **Via repos** |
+| `simulation/` | Day/period runners, invariants, progress | **Via steps/repos** |
+| `domain/` | Enums + frozen dataclasses | **No** |
+| `db/` | Connection, migrations, COPY helpers | **Yes** |
+
+Never put business rules in SQL repositories. Never put SQL in `core/`.
+
+---
+
+## Directory Layout
+
+```
+retail-simulator/
+  pyproject.toml
+  docker-compose.yml
+  .env.example
+  architecture.mdc              # this document
+  retail-simulator-*.txt        # business specs
+  migrations/                   # 0001_*.sql, 0002_*.sql, ...
+  src/retail_sim/
+    config.py
+    cli.py                      # db migrate | stores add | assortment optimize | simulate
+    rng.py                      # seed(global, date, store_id)
+    db/
+      connection.py
+      migrate.py
+      copy.py
+    domain/
+      enums.py                  # LocationType, OperationType, OptimizationFlag
+      models.py                 # frozen dataclasses
+      calendar.py               # Mon/Thu supply, Mon/Wed/Fri replenish
+    core/
+      demand.py
+      assortment.py
+      store_factory.py
+      receipts.py
+      allocation.py
+    repositories/
+      products.py stores.py movements.py stock.py receipts.py params.py locations.py
+    steps/
+      s0_opening_stock.py
+      s1_supplier.py
+      s2_assortment.py
+      s3_replenish.py
+      s4_sales.py
+    simulation/
+      day_runner.py             # steps 0..4 in one transaction
+      period_runner.py
+      invariants.py
+  tests/
+    unit/
+    integration/
+```
+
+---
+
+## Data Model Conventions
+
+### Ownership
+
+- `(man)` — filled manually: products, storage locations, warehouses, calculation parameters, store name pool; stores may be man or alg.
+- `(alg)` — written by simulator: assortment, opening stock, movements, receipts, receipt lines.
+
+### Physical table names (snake_case)
+
+| Spec name | Table |
+|-----------|--------|
+| Товары | `products` |
+| Места хранения | `storage_locations` |
+| Склады | `warehouses` |
+| Магазины | `stores` |
+| база названий | `store_name_pool` |
+| Параметры расчета | `calculation_parameters` |
+| Ассортимент магазинов | `store_assortment` |
+| остаток на начало дня | `daily_opening_stock` |
+| Движение товара | `inventory_movements` |
+| Чеки | `receipts` |
+| Чеки, товары | `receipt_lines` |
+
+### Critical schema rules
+
+- `serial` / `BIGSERIAL` only on primary keys; FKs are plain `BIGINT REFERENCES ...`.
+- One warehouse supplies all stores (v1); each store has `warehouse_id`.
+- Warehouses and stores each own a `storage_location_id`.
+- `calculation_parameters`: single row `id = 1` (`CHECK (id = 1)`).
+- `inventory_movements.quantity` is **signed** per location row:
+  - inbound / receiver: `+N`
+  - outbound / sale sender: `−N`
+  - transfers write **two** rows (sender −N, receiver +N)
+- Opening stock: `opening(d) = opening(d−1) + Σ movements(d−1)` (signed qty, no extra sign flip).
+- Current stock: `opening(today) + Σ movements(today)`.
+- Prefer `op_date DATE` (plus timestamp) on movements for range queries; index `(op_date, storage_location_id, product_id)`. `op_date` is `GENERATED ALWAYS AS (op_ts::date) STORED`; INSERT and COPY must omit it.
+- PK: `daily_opening_stock (stock_date, storage_location_id, product_id)`, `store_assortment (store_id, product_id)`.
+- `op_type ∈ ('приход','перемещение','продажа')`.
+- Optimization flag: `0` idle, `1` requested, `2` completed (set manually to `1`).
+- Continuity: prefer `max(stock_date)` from `daily_opening_stock` over max movement date.
+
+### Stock retention (alg)
+
+Relative to simulation “today”:
+
+- last 21 days: daily snapshots
+- days −70 … −22: keep week-start only (Monday)
+- before −71: keep month-start only
+
+---
+
+## Daily Simulation Pipeline
+
+One day = one DB transaction. Period = loop over days.
+
+```
+PeriodRunner
+  └─ DayRunner (per date)
+       ├─ S0 Opening stock (+ prune old snapshots)
+       ├─ S1 Supplier receipt (cold start 1000/sku; else Mon/Thu replenish)
+       ├─ S2 Assortment (new store or flag=1; delisted SKU → return to warehouse)
+       ├─ S3 Warehouse → store (Mon/Wed/Fri; deficit capped by warehouse stock)
+       ├─ S4 Sales (receipts + lines + sale movements)
+       └─ Invariants
+```
+
+### Step highlights (see logic file for full rules)
+
+0. **Opening stock** — incremental from prior day + prior-day movements; prune per retention policy.
+1. **Supplier** — if no movements: +1000 per SKU to warehouse. Else Mon/Thu: order to cover `target_stock_days_warehouse` from 21-day warehouse outflow (store shipments only); `ceil`, `min 0`.
+2. **Assortment** — new store: random SKUs up to capacity, even subcategory coverage. Flag=1: best SKUs by global avg sales within subcategories; return positive stock of delisted SKUs to warehouse; set flag=2.
+3. **Replenish** — Mon/Wed/Fri. Avg store usage over days with stock>0 or sales>0 in last 21 days; if avg=0 and stock=0 use assortment avg (ceil). Order to cover store target days (`ceil`); `qty = max(need, avg)`; never ship more than warehouse stock (proportional allocation on deficit).
+4. **Sales** — plan revenue = avg check × (store avg receipts ±20%). Emit checks until planned check totals exceed day revenue; fill with random in-stock assortment SKUs 1 unit at a time until check amount exceeded or stock empty; drop empty checks; write receipt tables + aggregated sale movements.
+
+Store creation (admin): N new storage locations + stores; names from unused `store_name_pool`; receipts ±50% of network avg; capacity `floor((store_receipts/network_receipts)*avg_capacity)`; hours 10:00±3h … 21:00±2h.
+
+---
+
+## CLI Surface (target)
+
+```text
+retail-sim db migrate [--migrations-dir PATH]
+retail-sim stores add N
+retail-sim assortment optimize   # or set flag manually in DB
+retail-sim simulate --from DATE --to DATE
+```
+
+Config via `DATABASE_URL`, `MIGRATIONS_DIR`, `SEED` (`.env`).
+
+---
+
+## Implementation Roadmap
+
+| Step | Scope | Status |
+|------|--------|--------|
+| 1 | Infra: uv, compose, config, migrate runner, CLI skeleton, ruff/mypy/pytest | Done |
+| 2 | DDL (constraints/indexes), domain enums/models, read repositories, schema tests | Done |
+| 3 | Opening stock engine + in-memory `DayStock` | Next |
+| 4 | Store factory + assortment | Pending |
+| 5 | Supplier receipts | Pending |
+| 6 | Warehouse→store + deficit allocation | Pending |
+| 7 | Receipt generation + COPY + benchmarks | Pending |
+| 8 | Period runner, invariants, resume-from-date | Pending |
+
+---
+
+## Coding Standards (project)
+
+- Senior, production-ready, modular, strictly typed Python.
+- Change only requested files/functions; no unprompted refactors or dependency bumps.
+- No placeholder stubs (`# TODO`, `# implement later`) inside requested scope.
+- Zero-assumption: if rounding, NULLs, or edge cases are unclear — **stop and ask**.
+- Prefer small targeted diffs over full-file rewrites.
+- Money in DB: `NUMERIC`; hot sales loops may use integer kopecks.
+- Day-level RNG: derive from `(global_seed, date, store_id)` for reproducible runs.
+
+---
+
+## Non-Goals (v1)
+
+- Multi-warehouse routing (one warehouse for all stores)
+- Automatic seed / demo data generation
+- Physical delete of stores (use inactive / no delete path as decided)
+- ORM / Alembic
+- Guessing unspecified business rules

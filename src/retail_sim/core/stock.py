@@ -14,8 +14,7 @@ class NegativeStockError(Exception):
         self.product_id = product_id
         self.quantity = quantity
         super().__init__(
-            f"Negative stock at location {storage_location_id} "
-            f"for product {product_id}: {quantity}"
+            f"Negative stock at location {storage_location_id} for product {product_id}: {quantity}"
         )
 
 
@@ -74,9 +73,7 @@ class DayStock:
             for stored_location_id, product_id in self._tracked_keys()
             if stored_location_id == location_id
         )
-        return {
-            product_id: self.current((location_id, product_id)) for product_id in product_ids
-        }
+        return {product_id: self.current((location_id, product_id)) for product_id in product_ids}
 
     def positive_keys(self) -> list[StockKey]:
         return sorted(key for key in self._tracked_keys() if self.current(key) > 0)

@@ -25,7 +25,9 @@ def test_custom_settings_override() -> None:
 
 
 def test_settings_from_environment() -> None:
-    with mock.patch.dict(os.environ, {"DATABASE_URL": "postgresql://test:test@localhost:5432/env_db"}):
+    with mock.patch.dict(
+        os.environ, {"DATABASE_URL": "postgresql://test:test@localhost:5432/env_db"}
+    ):
         settings = Settings()
         assert settings.database_url == "postgresql://test:test@localhost:5432/env_db"
 

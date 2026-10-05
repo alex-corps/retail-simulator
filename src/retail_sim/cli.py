@@ -13,6 +13,7 @@ from retail_sim.repositories.stores import StoreNotFoundError, list_stores, set_
 from retail_sim.steps.s0_opening_stock import run_opening_stock
 from retail_sim.steps.s1_supplier import run_supplier
 from retail_sim.steps.s2_assortment import run_assortment
+from retail_sim.steps.s3_replenish import rollback_replenish, run_replenish
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -64,6 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_supply_parser.add_argument("--date", type=date.fromisoformat, required=True)
 
+    replenish_parser = subparsers.add_parser("replenish", help="Warehouse-to-store replenishment")
+    replenish_subparsers = replenish_parser.add_subparsers(
+        dest="replenish_command",
+        required=True,
+    )
+    run_replenish_parser = replenish_subparsers.add_parser(
+        "run",
+        help="Replenish stores for one day (opening stock, supply, assortment, transfers)",
+    )
+    run_replenish_parser.add_argument("--date", type=date.fromisoformat, required=True)
+
     return parser
 
 
@@ -106,6 +118,35 @@ def handle_supply_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_replenish_run(args: argparse.Namespace) -> int:
+    settings = get_settings()
+    with get_connection(settings) as conn, conn.transaction():
+        stock = run_opening_stock(conn, args.date)
+        # Снимаем отгрузку до пересчёта прихода: иначе склад уйдёт в минус.
+        rollback_replenish(conn, args.date, stock)
+        supplier = run_supplier(conn, args.date, stock)
+        assortment = run_assortment(conn, args.date, stock, settings.seed)
+        result = run_replenish(conn, args.date, stock)
+    kind = "Cold start" if supplier.cold_start else "Supplier receipts"
+    print(
+        f"{kind}: {supplier.warehouses_supplied} warehouse(s), "
+        f"{supplier.skus_received} SKU line(s), "
+        f"{supplier.units_received} unit(s)."
+    )
+    print(
+        f"Built assortment for {assortment.stores_filled} store(s), "
+        f"optimized {assortment.stores_optimized} store(s), "
+        f"returned {assortment.skus_returned} SKU(s) to the warehouse."
+    )
+    print(
+        f"Replenishment: {result.stores_supplied} store(s), "
+        f"{result.skus_shipped} SKU line(s), "
+        f"{result.units_shipped} unit(s), "
+        f"{result.skus_short} short SKU(s)."
+    )
+    return 0
+
+
 def handle_assortment_optimize(args: argparse.Namespace) -> int:
     settings = get_settings()
     try:
@@ -135,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         return handle_assortment_optimize(args)
     if args.subcommand == "supply" and args.supply_command == "run":
         return handle_supply_run(args)
+    if args.subcommand == "replenish" and args.replenish_command == "run":
+        return handle_replenish_run(args)
 
     return 0
 

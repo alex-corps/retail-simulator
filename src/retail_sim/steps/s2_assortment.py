@@ -144,8 +144,7 @@ def _optimize_store(
     quotas = allocate_quotas(store.sku_capacity, sizes, rng, priority)
     chosen = pick_best(groups, quotas)
     old_items = {
-        item.product_id: item.avg_daily_sales
-        for item in list_store_assortment(conn, store.id)
+        item.product_id: item.avg_daily_sales for item in list_store_assortment(conn, store.id)
     }
     items = build_optimized_items(old_items, chosen, product_by_id, rng)
     delisted = find_delisted(old_items, chosen, store.storage_location_id, stock)

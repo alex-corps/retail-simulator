@@ -136,6 +136,23 @@ def set_optimization_flag(
             raise StoreNotFoundError(store_id)
 
 
+def list_assortment_by_store(conn: Connection[Any]) -> dict[int, list[StoreAssortmentItem]]:
+    # Весь ассортимент одним запросом: шаг раскладывает строки по магазинам.
+    with conn.cursor(row_factory=class_row(StoreAssortmentItem)) as cur:
+        cur.execute(
+            """
+            SELECT store_id, product_id, avg_daily_sales
+            FROM store_assortment
+            ORDER BY store_id, product_id
+            """
+        )
+        rows = cur.fetchall()
+    grouped: dict[int, list[StoreAssortmentItem]] = {}
+    for item in rows:
+        grouped.setdefault(item.store_id, []).append(item)
+    return grouped
+
+
 def list_store_assortment(conn: Connection[Any], store_id: int) -> list[StoreAssortmentItem]:
     with conn.cursor(row_factory=class_row(StoreAssortmentItem)) as cur:
         cur.execute(

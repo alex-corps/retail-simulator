@@ -3,6 +3,10 @@
 - Use `uv` for dependencies and scripts (`uv run`, `uv add`). Never use plain pip/poetry.
 - Always add `from __future__ import annotations` as first import. Use PEP 585/604 types (`list[str]`, `T | None`).
 
+# Code Comments & Language
+- Write all code comments and docstrings strictly in Russian.
+- Keep comments moderate in volume: explain non-obvious logic, business rules, and step boundaries without over-commenting trivial lines.
+
 # Zero-Assumption Policy
 - If business logic, rounding, NULLs, or edge cases are unclear, STOP and ask. Never guess.
 

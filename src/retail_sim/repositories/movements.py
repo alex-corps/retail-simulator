@@ -118,6 +118,37 @@ def delete_receipts(
     return removed
 
 
+def delete_store_replenishments(
+    conn: Connection[Any],
+    day: date,
+    warehouse_location_ids: Sequence[int],
+) -> dict[StockKey, int]:
+    # Отгрузка в магазин идёт из склада. Возврат (отправитель — магазин) не трогаем.
+    if not warehouse_location_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM inventory_movements
+            WHERE op_date = %(day)s
+              AND op_type = %(op_type)s
+              AND sender_location_id = ANY(%(warehouse_location_ids)s)
+            RETURNING storage_location_id, product_id, quantity
+            """,
+            {
+                "day": day,
+                "op_type": str(OperationType.TRANSFER),
+                "warehouse_location_ids": list(warehouse_location_ids),
+            },
+        )
+        rows = cur.fetchall()
+    removed: dict[StockKey, int] = {}
+    for location_id, product_id, quantity in rows:
+        key = (int(location_id), int(product_id))
+        removed[key] = removed.get(key, 0) + int(quantity)
+    return removed
+
+
 def daily_outflow(
     conn: Connection[Any],
     location_ids: Sequence[int],

@@ -5,10 +5,14 @@ from typing import TYPE_CHECKING, Any
 
 from psycopg.rows import class_row
 
+from retail_sim.db.copy import copy_rows
 from retail_sim.domain.enums import OptimizationFlag
 from retail_sim.domain.models import Store, StoreAssortmentItem
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from decimal import Decimal
+
     from psycopg import Connection
 
 _STORE_COLUMNS = """
@@ -77,6 +81,59 @@ def list_unused_store_names(conn: Connection[Any]) -> list[str]:
             """
         )
         return [str(row[0]) for row in cur.fetchall()]
+
+
+class StoreNotFoundError(Exception):
+    def __init__(self, store_id: int) -> None:
+        self.store_id = store_id
+        super().__init__(f"Store {store_id} does not exist")
+
+
+def list_store_ids_with_assortment(conn: Connection[Any]) -> list[int]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT store_id
+            FROM store_assortment
+            ORDER BY store_id
+            """
+        )
+        return [int(row[0]) for row in cur.fetchall()]
+
+
+def replace_store_assortment(
+    conn: Connection[Any],
+    store_id: int,
+    items: Sequence[tuple[int, Decimal]],
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM store_assortment WHERE store_id = %s", (store_id,))
+    if not items:
+        return
+    copy_rows(
+        conn,
+        "store_assortment",
+        ("store_id", "product_id", "avg_daily_sales"),
+        [(store_id, product_id, avg_daily_sales) for product_id, avg_daily_sales in items],
+    )
+
+
+def set_optimization_flag(
+    conn: Connection[Any],
+    store_id: int,
+    flag: OptimizationFlag,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE stores
+            SET optimization_flag = %s
+            WHERE id = %s
+            """,
+            (int(flag), store_id),
+        )
+        if cur.rowcount != 1:
+            raise StoreNotFoundError(store_id)
 
 
 def list_store_assortment(conn: Connection[Any], store_id: int) -> list[StoreAssortmentItem]:
